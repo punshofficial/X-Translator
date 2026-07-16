@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>X Translator harness</title>
+    <link rel="stylesheet" href="../content.css">
+    <style>
+      body { margin: 0; background: #000; color: #eff3f4; font: 15px/20px Arial, sans-serif; }
+      main { width: 600px; margin: 30px auto; }
+      article { border: 1px solid #2f3336; padding: 16px; }
+      .author { margin-bottom: 5px; font-weight: 700; }
+      [data-testid="tweetText"] { white-space: pre-wrap; font-size: 17px; line-height: 22px; }
+      a { color: #1d9bf0; text-decoration: none; }
+      .quote { margin: 12px 0 0 35px; border: 1px solid #536471; border-radius: 12px; padding: 12px; }
+    </style>
+    <script>
+      const changeListeners = [];
+      globalThis.xtrHarnessEvents = [];
+      globalThis.fetch = async (url) => {
+        xtrHarnessEvents.push({ type: "prefetch", at: Date.now(), url: String(url) });
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return '<article><a href="/longpost/status/123456">post</a><div dir="auto">This expandable post starts right here. This continuation appears after expansion.</div></article>';
+          },
+        };
+      };
+      globalThis.chrome = {
+        runtime: {
+          lastError: null,
+          sendMessage(message, callback) {
+            xtrHarnessEvents.push({ type: "request", at: Date.now(), texts: message.items.map((item) => item.plainText) });
+            const dictionary = new Map([
+              ["Hello @alice!\nRead https://example.com #news 🚀", "Привет, @alice!\nПрочитай https://example.com #news 🚀"],
+              ["This quoted post appeared later.", "Этот цитируемый пост появился позже."],
+              ["Public post uses semantic markup.", "Публичный пост использует семантическую разметку."],
+              ["This expandable post starts right here.\nПоказать ещё", "Этот раскрываемый пост начинается прямо здесь.\nПоказать ещё"],
+              ["This expandable post starts right here. This continuation appears after expansion.", "Этот раскрываемый пост начинается прямо здесь. Продолжение появилось после раскрытия."],
+            ]);
+            setTimeout(() => {
+              xtrHarnessEvents.push({ type: "response", at: Date.now(), texts: message.items.map((item) => item.plainText) });
+              if (new URLSearchParams(location.search).has("fail")) {
+                callback({ ok: false, code: "TEST_FAILURE", error: "Test failure" });
+                return;
+              }
+              callback({
+                ok: true,
+                results: message.items.map((item) => {
+                  let html = item.html;
+                  for (const [original, translated] of dictionary) {
+                    if (item.plainText === original) {
+                      const protectedParts = [...html.matchAll(/<span class="notranslate"[^>]*>[\s\S]*?<\/span>/g)].map((m) => m[0]);
+                      html = `<div>${translated}</div>`;
+                      protectedParts.forEach((part) => {
+                        const text = part.replace(/<[^>]+>/g, "");
+                        html = html.replace(text, part);
+                      });
+                      html = html.replace(/\n/g, "<br>");
+                    }
+                  }
+                  return { id: item.id, translatedHtml: html, detectedLanguage: "en" };
+                }),
+              });
+            }, 1500);
+          },
+        },
+        storage: {
+          local: { get(defaults, callback) { callback(defaults); } },
+          onChanged: { addListener(listener) { changeListeners.push(listener); } },
+        },
+      };
+    </script>
+  </head>
+  <body>
+    <main id="feed">
+      <article data-testid="tweet">
+        <div class="author">Alice <span style="color:#71767b">@alice</span></div>
+        <div data-testid="tweetText" lang="en">Hello <a href="/alice">@alice</a>!
+Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/news">#news</a> 🚀</div>
+      </article>
+      <article data-tweet-id="123" itemscope itemtype="https://schema.org/SocialMediaPosting">
+        <meta itemprop="articleBody" content="Public post uses semantic markup.">
+        <div class="author">Public <span style="color:#71767b">@public</span></div>
+        <div dir="auto"><span>Public post uses semantic markup.</span></div>
+      </article>
+      <article id="expandable-post" data-testid="tweet">
+        <div class="author">Expandable <span style="color:#71767b">@longpost</span></div>
+        <a href="/longpost/status/123456"><time>now</time></a>
+        <div data-testid="tweetText" lang="en">This expandable post starts right here.
+<a href="#" data-demo-show-more>Показать ещё</a></div>
+      </article>
+    </main>
+    <script src="../shared.js"></script>
+    <script src="../content.js"></script>
+    <script>
+      document.addEventListener("click", (event) => {
+        const control = event.target.closest?.("[data-demo-show-more]");
+        if (!control) return;
+        xtrHarnessEvents.push({ type: "expand-click", at: Date.now() });
+        event.preventDefault();
+        const article = control.closest("article");
+        const replacement = article.cloneNode(true);
+        const original = replacement.querySelector('[data-testid="tweetText"]');
+        original.previousElementSibling?.remove();
+        original.nextElementSibling?.remove();
+        original.removeAttribute("data-xtr-original-hidden");
+        original.textContent = "This expandable post starts right here. This continuation appears after expansion.";
+        article.replaceWith(replacement);
+      });
+
+      setTimeout(() => {
+        const article = document.createElement("article");
+        article.className = "quote";
+        article.innerHTML = '<div class="author">Bob @bob</div><div data-testid="tweetText" lang="en">This quoted post appeared later.</div>';
+        document.getElementById("feed").append(article);
+      }, 250);
+    </script>
+  </body>
+</html>

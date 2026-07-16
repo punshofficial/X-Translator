@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>X Translator</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header class="header">
+        <div class="brand">
+          <img src="icons/icon48.png?v=027" width="40" height="40" alt="">
+          <div>
+            <h1>X Translator</h1>
+            <p>Перевод постов на русский</p>
+          </div>
+        </div>
+        <label class="switch" aria-label="Включить перевод">
+          <input id="enabled" type="checkbox">
+          <span></span>
+        </label>
+      </header>
+
+      <section class="status-card" aria-labelledby="serviceTitle">
+        <div class="status-card__top">
+          <div class="service-copy">
+            <div class="service-title">
+              <span id="readyDot" class="ready-dot" aria-hidden="true"></span>
+              <strong id="serviceTitle">Автоперевод включён</strong>
+            </div>
+            <p id="serviceDescription">Посты, ответы и цитаты</p>
+          </div>
+          <button id="testButton" type="button">Проверить</button>
+        </div>
+        <p id="status" class="status" role="status" hidden></p>
+      </section>
+
+      <section class="overview" aria-label="Статистика">
+        <div class="section-heading">
+          <span>Статистика</span>
+          <button id="clearCache" type="button">Очистить кэш</button>
+        </div>
+        <div class="metrics">
+          <div class="metric">
+            <span>Переведено</span>
+            <strong id="statTotal">0</strong>
+            <small>переводов</small>
+          </div>
+          <div class="metric">
+            <span>Из кэша</span>
+            <strong id="statCacheRate">0%</strong>
+            <small id="statCache">0 мгновенно</small>
+          </div>
+        </div>
+      </section>
+
+      <footer class="privacy-note">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 8V6a5 5 0 0 0-10 0v2H5v14h14V8h-2Zm-8-2a3 3 0 0 1 6 0v2H9V6Zm8 14H7V10h10v10Z"></path></svg>
+        <span>На перевод отправляется только текст постов</span>
+      </footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

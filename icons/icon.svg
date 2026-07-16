@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="background" x1="18" y1="10" x2="110" y2="122" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#121923"/>
+      <stop offset="1" stop-color="#06080C"/>
+    </linearGradient>
+    <linearGradient id="forward" x1="18" y1="43" x2="104" y2="43" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#13C8FF"/>
+      <stop offset="1" stop-color="#1D8CFF"/>
+    </linearGradient>
+    <linearGradient id="backward" x1="110" y1="85" x2="24" y2="85" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A855F7"/>
+      <stop offset="1" stop-color="#6D5CFF"/>
+    </linearGradient>
+    <filter id="glow" x="-25%" y="-35%" width="150%" height="170%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feComposite in="blur" in2="SourceGraphic" operator="out" result="halo"/>
+      <feColorMatrix in="halo" values="1 0 0 0 0.08 0 1 0 0 0.58 0 0 1 0 1 0 0 0 .32 0"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="34" fill="url(#background)"/>
+  <rect x="4.75" y="4.75" width="118.5" height="118.5" rx="33.25" fill="none" stroke="#FFFFFF" stroke-opacity=".1" stroke-width="1.5"/>
+
+  <g filter="url(#glow)">
+    <path d="M28 29H78V20L105 43L78 66V57H28C19.7 57 15 51.9 15 43S19.7 29 28 29Z" fill="url(#forward)"/>
+    <path d="M100 71H50V62L23 85L50 108V99H100C108.3 99 113 93.9 113 85S108.3 71 100 71Z" fill="url(#backward)"/>
+  </g>
+
+  <rect x="29" y="39" width="29" height="8" rx="4" fill="#FFFFFF" fill-opacity=".96"/>
+  <rect x="63" y="39" width="14" height="8" rx="4" fill="#FFFFFF" fill-opacity=".54"/>
+  <rect x="70" y="81" width="29" height="8" rx="4" fill="#FFFFFF" fill-opacity=".96"/>
+  <rect x="51" y="81" width="14" height="8" rx="4" fill="#FFFFFF" fill-opacity=".54"/>
+</svg>
