@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "X Translator",
   "description": "Автоматически переводит на русский только тексты постов, ответов и цитат в X.",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "permissions": [
     "storage"
   ],

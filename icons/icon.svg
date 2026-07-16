@@ -20,8 +20,7 @@
     </filter>
   </defs>
 
-  <rect x="4" y="4" width="120" height="120" rx="34" fill="url(#background)"/>
-  <rect x="4.75" y="4.75" width="118.5" height="118.5" rx="33.25" fill="none" stroke="#FFFFFF" stroke-opacity=".1" stroke-width="1.5"/>
+  <rect width="128" height="128" fill="url(#background)"/>
 
   <g filter="url(#glow)">
     <path d="M28 29H78V20L105 43L78 66V57H28C19.7 57 15 51.9 15 43S19.7 29 28 29Z" fill="url(#forward)"/>

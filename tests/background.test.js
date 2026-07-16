@@ -119,7 +119,31 @@ test("background bootstraps an anonymous Bing session without a user key", async
   const form = new URLSearchParams(background.fetchCalls[1].options.body);
   assert.equal(form.get("key"), "1234567890");
   assert.equal(form.get("token"), "anonymous-token");
+  assert.equal(form.get("fromLang"), "auto-detect");
   assert.equal(form.get("to"), "ru");
+});
+
+test("background auto-detects languages other than English", async () => {
+  const background = createBackground({ enabled: true }, (url, options = {}) => {
+    if (String(url).endsWith("/translator")) return response(200, SESSION_HTML);
+
+    const form = new URLSearchParams(options.body);
+    assert.equal(form.get("fromLang"), "auto-detect");
+    assert.equal(form.get("text"), "Hola");
+    return response(200, JSON.stringify([{
+      detectedLanguage: { language: "es" },
+      translations: [{ text: "Привет", to: "ru" }],
+    }]));
+  });
+
+  const result = await background.send({
+    type: "TRANSLATE_BATCH",
+    items: [{ id: "es-1", html: "<div>Hola</div>", plainText: "Hola" }],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].detectedLanguage, "es");
+  assert.match(result.results[0].translatedHtml, /Привет/);
 });
 
 test("background preserves protected tokens, line breaks, cache and item ids", async () => {
