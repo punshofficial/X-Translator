@@ -5,7 +5,8 @@
   "description": "Локальное Chrome/Edge-расширение для автоперевода постов X на русский.",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "check": "node --check background.js && node --check content.js && node --check popup.js && npm test"
+    "check": "node --check background.js && node --check content.js && node --check popup.js && npm test",
+    "package": "bash scripts/package.sh"
   },
   "engines": {
     "node": ">=20"
