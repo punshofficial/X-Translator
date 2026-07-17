@@ -6,6 +6,10 @@
   display: none !important;
 }
 
+[data-xtr-native-translation-hidden="true"] {
+  display: none !important;
+}
+
 .xtr-shimmer {
   color: transparent !important;
   background-image: linear-gradient(

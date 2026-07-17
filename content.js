@@ -11,6 +11,8 @@
   const PRIMARY_SELECTOR = '[data-testid="tweetText"]';
   const PUBLIC_ARTICLE_SELECTOR = 'article[data-tweet-id][itemtype="https://schema.org/SocialMediaPosting"]';
   const OWNED_SELECTOR = "[data-xtr-owned]";
+  const NATIVE_TRANSLATION_HIDDEN_ATTR = "data-xtr-native-translation-hidden";
+  const SOURCE_ICON_PATH = "M12.745 20.54l10.97-8.19c.539-.4 1.307-.244 1.564.38 1.349 3.288.746 7.241-1.938 9.955-2.683 2.714-6.417 3.31-9.83 1.954l-3.728 1.745c5.347 3.697 11.84 2.782 15.898-1.324 3.219-3.255 4.216-7.692 3.284-11.693l.008.009c-1.351-5.878.332-8.227 3.782-13.031L33 0l-4.54 4.59v-.014L12.743 20.544m-2.263 1.987c-3.837-3.707-3.175-9.446.1-12.755 2.42-2.449 6.388-3.448 9.852-1.979l3.72-1.737c-.67-.49-1.53-1.017-2.515-1.387-4.455-1.854-9.789-.931-13.41 2.728-3.483 3.523-4.579 8.94-2.697 13.561 1.405 3.454-.899 5.898-3.22 8.364C1.49 30.2.666 31.074 0 32l10.478-9.466";
   const TARGET_LANGUAGE = "ru";
   const BATCH_SIZE = 4;
   const BATCH_CHARACTERS = 30_000;
@@ -198,7 +200,11 @@
     const fingerprint = `${request.plainText}\u0000${request.html}`;
     const previous = states.get(element);
     if (previous && previous.fingerprint === fingerprint) {
-      if (["queued", "loading", "translated", "skipped"].includes(previous.status)) return;
+      if (previous.status === "translated") {
+        syncNativeTranslationRow(previous.view);
+        return;
+      }
+      if (["queued", "loading", "skipped"].includes(previous.status)) return;
       if (previous.status === "error" && Date.now() < previous.retryAt) return;
     }
 
@@ -678,6 +684,7 @@
       view.translatedElement = translated;
       view.sourceElement = state.element;
       setOriginalVisible(view, view.showingOriginal);
+      syncNativeTranslationRow(view);
       state.status = "translated";
       ensureExpansionPrefetch(state);
       return;
@@ -690,6 +697,7 @@
       translatedElement: translated,
       showingOriginal: false,
       expansionElement: null,
+      nativeTranslationRows: new Set(),
     };
     const meta = createMetaRow(result.detectedLanguage, view);
     view.metaElement = meta;
@@ -697,6 +705,7 @@
     state.element.before(meta);
     state.element.after(translated);
     setOriginalVisible(view, false);
+    syncNativeTranslationRow(view);
     state.status = "translated";
     ensureExpansionPrefetch(state);
   }
@@ -752,12 +761,14 @@
       node.removeAttribute("data-testid");
       node.removeAttribute("aria-describedby");
       node.removeAttribute("data-xtr-original-hidden");
+      node.removeAttribute(NATIVE_TRANSLATION_HIDDEN_ATTR);
     });
   }
 
   function createMetaRow(languageCode, view) {
     const row = document.createElement("div");
     row.dir = "ltr";
+    row.setAttribute("data-xtr-owned", "meta");
     row.className = "css-146c3p1 r-bcqeeo r-qvutc0 r-37j5jr r-n6v787 r-1cwl3u0 r-16dba41 r-9aw3ui r-1ceczpf r-1h8ys4a r-fdjqy7 r-1mnahxq";
     row.style.color = "rgb(113, 118, 123)";
 
@@ -814,7 +825,7 @@
     icon.setAttribute("aria-hidden", "true");
     const group = document.createElementNS(namespace, "g");
     const path = document.createElementNS(namespace, "path");
-    path.setAttribute("d", "M12.745 20.54l10.97-8.19c.539-.4 1.307-.244 1.564.38 1.349 3.288.746 7.241-1.938 9.955-2.683 2.714-6.417 3.31-9.83 1.954l-3.728 1.745c5.347 3.697 11.84 2.782 15.898-1.324 3.219-3.255 4.216-7.692 3.284-11.693l.008.009c-1.351-5.878.332-8.227 3.782-13.031L33 0l-4.54 4.59v-.014L12.743 20.544m-2.263 1.987c-3.837-3.707-3.175-9.446.1-12.755 2.42-2.449 6.388-3.448 9.852-1.979l3.72-1.737c-.67-.49-1.53-1.017-2.515-1.387-4.455-1.854-9.789-.931-13.41 2.728-3.483 3.523-4.579 8.94-2.697 13.561 1.405 3.454-.899 5.898-3.22 8.364C1.49 30.2.666 31.074 0 32l10.478-9.466");
+    path.setAttribute("d", SOURCE_ICON_PATH);
     group.append(path);
     icon.append(group);
     return icon;
@@ -954,6 +965,36 @@
     if (view.buttonElement) view.buttonElement.setAttribute("aria-label", text);
   }
 
+  function syncNativeTranslationRow(view) {
+    if (!view?.sourceElement || !view.metaElement) return;
+    let candidate = view.sourceElement.previousElementSibling;
+
+    for (let steps = 0; candidate && steps < 4; steps += 1) {
+      if (isNativeTranslationRow(candidate)) {
+        candidate.setAttribute(NATIVE_TRANSLATION_HIDDEN_ATTR, "true");
+        view.nativeTranslationRows ||= new Set();
+        view.nativeTranslationRows.add(candidate);
+        return;
+      }
+      if (candidate.matches?.(PRIMARY_SELECTOR) || candidate.querySelector?.(PRIMARY_SELECTOR)) return;
+      candidate = candidate.previousElementSibling;
+    }
+  }
+
+  function isNativeTranslationRow(element) {
+    if (!element || element.matches?.(OWNED_SELECTOR) || element.closest?.(OWNED_SELECTOR)) return false;
+    const button = element.querySelector?.(':scope > button[aria-label]');
+    const path = element.querySelector?.(':scope > svg[viewBox="0 0 33 32"] path');
+    return Boolean(button && path?.getAttribute("d") === SOURCE_ICON_PATH);
+  }
+
+  function restoreNativeTranslationRows(view) {
+    for (const row of view?.nativeTranslationRows || []) {
+      row.removeAttribute?.(NATIVE_TRANSLATION_HIDDEN_ATTR);
+    }
+    view?.nativeTranslationRows?.clear?.();
+  }
+
   function displayLanguage(code) {
     if (!code) return "не определён";
     try {
@@ -974,6 +1015,7 @@
   function removeStateView(state) {
     const view = state.view;
     if (!view || view.owner !== state) return;
+    restoreNativeTranslationRows(view);
     clearExpansionPending(view);
     view.metaElement?.remove();
     view.translatedElement?.remove();
