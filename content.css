@@ -1,3 +1,7 @@
+[data-xtr-early-guard] [data-testid="tweetText"][lang]:not([lang|="ru" i]):not([data-xtr-source-ready]) {
+  visibility: hidden;
+}
+
 [data-xtr-original-hidden="true"] {
   display: none !important;
 }
@@ -10,21 +14,57 @@
   display: none !important;
 }
 
+[data-xtr-native-expansion-hidden="true"] {
+  display: none !important;
+}
+
+[data-xtr-full-content] {
+  display: block;
+}
+
+[data-xtr-expand-control] {
+  display: block;
+  width: fit-content;
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: rgb(29, 155, 240);
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+[data-xtr-expand-control][hidden] {
+  display: none !important;
+}
+
+[data-xtr-blur-token] {
+  display: inline-block;
+}
+
+[data-xtr-owned="translation"][data-xtr-reveal="blur-text"] [data-xtr-blur-token],
+[data-xtr-owned="translation"][data-xtr-reveal="blur-text"] img {
+  will-change: filter, opacity, transform;
+}
+
+/* Shimmer Mask by Animshelf: https://animshelf.dev/text-animations/shimmer-mask */
 .xtr-shimmer {
+  --xtr-shimmer-base: rgb(113, 118, 123);
+  --xtr-shimmer-highlight: rgb(239, 243, 244);
   color: transparent !important;
   background-image: linear-gradient(
-    90deg,
-    rgb(113, 118, 123) 0%,
-    rgb(113, 118, 123) 34%,
-    rgb(239, 243, 244) 50%,
-    rgb(113, 118, 123) 66%,
-    rgb(113, 118, 123) 100%
-  );
-  background-position: 140% 0;
-  background-size: 250% 100%;
+    100deg,
+    rgb(239 243 244 / 0) 42%,
+    var(--xtr-shimmer-highlight) 50%,
+    rgb(239 243 244 / 0) 58%
+  ), linear-gradient(var(--xtr-shimmer-base), var(--xtr-shimmer-base));
+  background-position: 120% 0, 0 0;
+  background-repeat: no-repeat, no-repeat;
+  background-size: 220% 100%, 100% 100%;
   background-clip: text;
   -webkit-background-clip: text;
-  animation: xtr-shimmer 1.45s ease-in-out infinite;
+  animation: xtr-shimmer 2.8s linear infinite;
 }
 
 .xtr-inline-action {
@@ -49,27 +89,27 @@
 }
 
 @keyframes xtr-shimmer {
-  from { background-position: 140% 0; }
-  to { background-position: -140% 0; }
+  from { background-position: 120% 0, 0 0; }
+  to { background-position: -120% 0, 0 0; }
 }
 
 @media (prefers-color-scheme: light) {
   .xtr-shimmer {
+    --xtr-shimmer-base: rgb(83, 100, 113);
+    --xtr-shimmer-highlight: rgb(15, 20, 25);
     background-image: linear-gradient(
-      90deg,
-      rgb(83, 100, 113) 0%,
-      rgb(83, 100, 113) 34%,
-      rgb(15, 20, 25) 50%,
-      rgb(83, 100, 113) 66%,
-      rgb(83, 100, 113) 100%
-    );
+      100deg,
+      rgb(15 20 25 / 0) 42%,
+      var(--xtr-shimmer-highlight) 50%,
+      rgb(15 20 25 / 0) 58%
+    ), linear-gradient(var(--xtr-shimmer-base), var(--xtr-shimmer-base));
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .xtr-shimmer {
     animation: none;
-    background: none;
-    color: rgb(113, 118, 123) !important;
+    background-image: none;
+    color: var(--xtr-shimmer-base) !important;
   }
 }

@@ -12,39 +12,63 @@
   const PUBLIC_ARTICLE_SELECTOR = 'article[data-tweet-id][itemtype="https://schema.org/SocialMediaPosting"]';
   const OWNED_SELECTOR = "[data-xtr-owned]";
   const NATIVE_TRANSLATION_HIDDEN_ATTR = "data-xtr-native-translation-hidden";
+  const NATIVE_EXPANSION_HIDDEN_ATTR = "data-xtr-native-expansion-hidden";
+  const EARLY_GUARD_ATTR = "data-xtr-early-guard";
+  const SOURCE_READY_ATTR = "data-xtr-source-ready";
+  const EXPAND_CONTROL_ATTR = "data-xtr-expand-control";
+  const FULL_CONTENT_ATTR = "data-xtr-full-content";
   const SOURCE_ICON_PATH = "M12.745 20.54l10.97-8.19c.539-.4 1.307-.244 1.564.38 1.349 3.288.746 7.241-1.938 9.955-2.683 2.714-6.417 3.31-9.83 1.954l-3.728 1.745c5.347 3.697 11.84 2.782 15.898-1.324 3.219-3.255 4.216-7.692 3.284-11.693l.008.009c-1.351-5.878.332-8.227 3.782-13.031L33 0l-4.54 4.59v-.014L12.743 20.544m-2.263 1.987c-3.837-3.707-3.175-9.446.1-12.755 2.42-2.449 6.388-3.448 9.852-1.979l3.72-1.737c-.67-.49-1.53-1.017-2.515-1.387-4.455-1.854-9.789-.931-13.41 2.728-3.483 3.523-4.579 8.94-2.697 13.561 1.405 3.454-.899 5.898-3.22 8.364C1.49 30.2.666 31.074 0 32l10.478-9.466";
   const TARGET_LANGUAGE = "ru";
-  const BATCH_SIZE = 4;
-  const BATCH_CHARACTERS = 30_000;
+  const TRANSLATION_CONCURRENCY = 2;
   const RETRY_DELAY = 5_000;
   const MAX_RETRY_DELAY = 30_000;
   const EXPANSION_PREFETCH_LIMIT = 40;
+  const VIEWPORT_MARGIN_FACTOR = 0.75;
   const INITIAL_LOADING_DELAY = 350;
+  const EARLY_GUARD_TIMEOUT = INITIAL_LOADING_DELAY + 100;
+  // Blur Text by Animshelf: https://animshelf.dev/text-animations/blur-text
+  const BLUR_TEXT_DURATION = 700;
+  const BLUR_TEXT_STAGGER = 55;
+  const BLUR_TEXT_AMOUNT = 18;
+  const BLUR_TEXT_OFFSET = 10;
+  const BLUR_TEXT_MAX_DURATION = 6_000;
+  const BLUR_TEXT_EASING = "cubic-bezier(.22,.61,.36,1)";
 
   const states = new WeakMap();
   const trackedStates = new Set();
   const queue = [];
   let enabled = true;
   let flushTimer = null;
-  let flushInFlight = false;
+  let activeTranslations = 0;
   let scanTimer = null;
+  let earlyGuardTimer = null;
   let requestSequence = 0;
   const expansionPrefetches = new Map();
-  const expansionPrefetchQueue = [];
-  let expansionPrefetchActive = false;
+  const expansionControls = new WeakMap();
+  const nativeExpansionControls = new WeakMap();
+  const revealAnimations = new WeakMap();
+  const presentedTranslations = new Set();
+  const releasedSources = new Set();
+  const expandedPostTranslations = new Set();
 
   start();
 
   async function start() {
     const settings = await storageGet({ enabled: true });
     enabled = settings.enabled !== false;
+    setEarlyGuard(enabled);
     observePage();
     scanDocument();
 
     document.addEventListener("click", handleExpansionClick, true);
+    document.addEventListener("keydown", handleExpansionKeydown, true);
     window.addEventListener("pageshow", scheduleScan, true);
     window.addEventListener("popstate", scheduleScan, true);
     window.addEventListener("hashchange", scheduleScan, true);
+    document.addEventListener("scroll", () => scheduleScan(40), {
+      capture: true,
+      passive: true,
+    });
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) scheduleScan();
     });
@@ -62,14 +86,19 @@
       for (const mutation of mutations) {
         if (isOwnedMutation(mutation)) continue;
         shouldScan = true;
-        urgent ||= mutation.type === "childList"
-          && [...mutation.removedNodes].some((node) => (
+        urgent ||= mutation.type === "childList" && (
+          [...mutation.removedNodes].some((node) => (
             node.nodeType === Node.ELEMENT_NODE
             && (node.matches?.(OWNED_SELECTOR) || node.querySelector?.(OWNED_SELECTOR))
-          ));
+          ))
+          || [...mutation.addedNodes].some((node) => (
+            node.nodeType === Node.ELEMENT_NODE
+            && (node.matches?.(PRIMARY_SELECTOR) || node.querySelector?.(PRIMARY_SELECTOR))
+          ))
+        );
       }
       if (urgent) {
-        scheduleScan(0);
+        scanDocument();
       } else if (shouldScan) {
         scheduleScan(60);
       }
@@ -88,9 +117,13 @@
       if (changes.enabled) {
         enabled = changes.enabled.newValue !== false;
         if (!enabled) {
+          setEarlyGuard(false);
           removeAllTranslations();
           return;
         }
+        document.querySelectorAll(`[${SOURCE_READY_ATTR}]`)
+          .forEach((element) => element.removeAttribute(SOURCE_READY_ATTR));
+        setEarlyGuard(true);
       }
 
       if (changes.enabled) {
@@ -106,11 +139,22 @@
 
   function handleExpansionClick(event) {
     const control = event.target?.closest?.('button, a, [role="button"]');
-    if (!control || !isExpandableText(control.textContent)) return;
+    if (!control || !isExpansionLabel(control.textContent)) return;
+
+    const translatedView = expansionControls.get(control);
+    if (translatedView) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      expandTranslatedView(translatedView);
+      return;
+    }
+
     const article = control.closest('article[data-testid="tweet"]') || control.closest("article");
     const source = article?.querySelector(PRIMARY_SELECTOR);
-    const state = source ? states.get(source) : null;
-    if (state?.view) showExpansionPending(state.view);
+    const state = nativeExpansionControls.get(control) || (source ? states.get(source) : null);
+    if (state) rememberTranslationExpanded(state);
+    const prepared = state?.postKey ? expansionPrefetches.get(state.postKey) : null;
+    if (state?.view && prepared?.status !== "ready") showExpansionPending(state.view);
 
     setTimeout(() => {
       if (enabled) scanDocument();
@@ -118,6 +162,16 @@
     setTimeout(() => {
       if (enabled) scanDocument();
     }, 60);
+  }
+
+  function handleExpansionKeydown(event) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const control = event.target?.closest?.(`[${EXPAND_CONTROL_ATTR}]`);
+    const view = control ? expansionControls.get(control) : null;
+    if (!view) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    expandTranslatedView(view);
   }
 
   function isOwnedMutation(mutation) {
@@ -154,9 +208,17 @@
     });
 
     [...targets]
+      .filter((element) => states.has(element) || isNearViewport(element))
       .map((element) => ({ element, priority: elementPriority(element) }))
       .sort((left, right) => left.priority - right.priority)
       .forEach(({ element }) => processTarget(element));
+  }
+
+  function isNearViewport(element) {
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || 800;
+    const margin = viewportHeight * VIEWPORT_MARGIN_FACTOR;
+    return rect.bottom >= -margin && rect.top <= viewportHeight + margin;
   }
 
   function elementPriority(element) {
@@ -189,40 +251,72 @@
     if (!enabled || !element.isConnected || element.closest(OWNED_SELECTOR)) return;
 
     const request = buildRequest(element);
-    if (!request.plainText || request.plainText.length < 2) return;
+    if (!request.plainText || request.plainText.length < 2) {
+      releaseSource(element);
+      return;
+    }
 
     // Do not inherit <html lang>: on public X pages it describes the interface,
     // not the post. When the text container has no own language, let Bing
     // detect it from the post body.
     const sourceLanguage = element.getAttribute("lang") || "";
-    if (languagesMatch(sourceLanguage, TARGET_LANGUAGE)) return;
+    if (languagesMatch(sourceLanguage, TARGET_LANGUAGE)) {
+      releaseSource(element);
+      return;
+    }
 
     const fingerprint = `${request.plainText}\u0000${request.html}`;
     const previous = states.get(element);
     if (previous && previous.fingerprint === fingerprint) {
       if (["queued", "loading", "translated"].includes(previous.status)) {
+        if (previous.view) ensureViewMounted(previous);
+        if (
+          !previous.view
+          && previous.pendingElement
+          && !previous.pendingElement.isConnected
+        ) {
+          previous.pendingElement = null;
+          showInitialLoading(previous);
+        }
         syncNativeTranslationRow(previous);
         return;
       }
-      if (previous.status === "skipped") return;
+      if (previous.status === "skipped") {
+        releaseSource(element);
+        return;
+      }
       if (previous.status === "error" && Date.now() < previous.retryAt) return;
     }
 
     const location = locateTarget(element);
-    const reusableState = previous?.view
-      ? previous
-      : findAdjacentViewState(element)
-        || findContainerViewState(location, request.plainText);
+    const expansionControl = findPostExpansionControl(element, location.containerElement);
+    const isExpandable = Boolean(expansionControl) || isExpandableText(request.plainText);
+    const reusableState = previous
+      || findAdjacentViewState(element)
+      || findContainerState(location, request.plainText);
     const reusableView = reusableState?.view || null;
+    const reusablePendingElement = reusableState?.pendingElement?.isConnected
+      ? reusableState.pendingElement
+      : null;
+    const reusableLoadingDeadline = reusableState?.loadingDeadline || 0;
+    const canReuseCompletedTranslation = Boolean(
+      reusableState?.status === "translated"
+      && reusableState.fingerprint === fingerprint
+      && reusableView?.translatedElement,
+    );
     const nativeTranslationRows = reusableState?.nativeTranslationRows || new Set();
     const isExpansionReplacement = Boolean(
       reusableState
-      && isExpandableText(reusableState.plainText)
-      && !isExpandableText(request.plainText)
+      && reusableState.isExpandable
+      && !isExpandable
       && request.plainText.length > expansionBase(reusableState.plainText).length + 8,
     );
 
     if (reusableState) {
+      if (reusableState.loadingTimer !== null) clearTimeout(reusableState.loadingTimer);
+      reusableState.loadingTimer = null;
+      reusableState.loadingDeadline = 0;
+      reusableState.pendingElement = null;
       reusableState.status = "superseded";
       trackedStates.delete(reusableState);
       if (reusableState.element !== element) states.delete(reusableState.element);
@@ -240,14 +334,31 @@
       retryAt: 0,
       retryCount: Math.max(previous?.retryCount || 0, reusableState?.retryCount || 0),
       loadingTimer: null,
-      pendingElement: null,
+      loadingDeadline: reusableLoadingDeadline,
+      pendingElement: reusablePendingElement,
       view: reusableView,
       containerElement: location.containerElement,
       targetIndex: location.targetIndex,
       postKey: location.postKey,
-      isExpandable: isExpandableText(request.plainText),
+      isExpandable,
+      sourceExpansionControl: expansionControl,
+      collapsedMetrics: isExpandable
+        ? measureCollapsedSource(element, expansionControl)
+        : null,
+      translationRequest: null,
+      translationPromise: null,
+      errorKind: "",
+      expandTranslationOnApply: isExpansionReplacement,
       nativeTranslationRows,
     };
+    if (releasedSources.has(translationContentKey(state))) {
+      releaseSource(element);
+    } else {
+      holdSource(element);
+    }
+    if (state.pendingElement && element.previousElementSibling !== state.pendingElement) {
+      element.before(state.pendingElement);
+    }
     if (reusableView) {
       location.containerElement
         ?.querySelectorAll?.('[data-xtr-owned="expansion-status"]')
@@ -256,6 +367,7 @@
         });
       reusableView.owner = state;
       reusableView.sourceElement = element;
+      reusableView.sourceExpansionControl = expansionControl;
       reusableView.nativeTranslationRows = nativeTranslationRows;
       if (element.previousElementSibling !== reusableView.metaElement) {
         element.before(reusableView.metaElement);
@@ -269,19 +381,39 @@
       setOriginalVisible(reusableView, reusableView.showingOriginal);
     }
     states.set(element, state);
+    if (expansionControl) nativeExpansionControls.set(expansionControl, state);
     trackedStates.add(state);
     syncNativeTranslationRow(state);
 
+    if (canReuseCompletedTranslation) {
+      state.status = "translated";
+      ensureViewMounted(state);
+      return;
+    }
+
     const prefetched = matchingExpansionPrefetch(state);
     if (prefetched?.status === "ready") {
-      applyTranslation(state, prefetched.result);
+      applyTranslation(state, prefetched.result, prefetched.request, {
+        collapsible: state.isExpandable && !state.expandTranslationOnApply,
+        expanded: isTranslationExpanded(state),
+      });
+      return;
+    }
+
+    if (state.isExpandable) {
+      if (state.postKey) {
+        const entry = ensureExpansionPrefetch(state);
+        waitForExpansionPrefetch(state, entry);
+      } else {
+        markForRetry(state, 0, "full-text");
+      }
       return;
     }
 
     if (isExpansionReplacement) {
-      showExpansionPending(state.view);
       const pending = expansionPrefetches.get(state.postKey);
-      if (pending && ["queued", "loading"].includes(pending.status)) {
+      if (pending && ["fetching", "queued", "loading"].includes(pending.status)) {
+        showExpansionPending(state.view);
         waitForExpansionPrefetch(state, pending);
         return;
       }
@@ -290,12 +422,30 @@
     enqueueState(state);
   }
 
-  function enqueueState(state) {
+  function enqueueState(state, request = state) {
     if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
+    if (state.translationPromise) return;
+    state.translationRequest = request;
     state.status = "queued";
-    if (!queue.includes(state)) queue.push(state);
     scheduleInitialLoading(state);
-    scheduleFlush();
+    state.translationPromise = requestTranslation({
+      id: state.requestId,
+      html: request.html,
+      plainText: request.plainText,
+    }, translationPriority(state), () => {
+      if (states.get(state.element) === state && state.status === "queued") {
+        state.status = "loading";
+      }
+    }).then((result) => {
+      state.translationPromise = null;
+      if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
+      applyTranslation(state, result, request);
+    }).catch((error) => {
+      state.translationPromise = null;
+      if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
+      console.debug("[X Translator] Перевод временно недоступен:", error);
+      markForRetry(state, error?.retryAfterMs, error?.xtrKind || "translation");
+    });
   }
 
   function findAdjacentViewState(element) {
@@ -329,10 +479,11 @@
     };
   }
 
-  function findContainerViewState(location, plainText) {
+  function findContainerState(location, plainText) {
     if (!location.containerElement && !location.postKey) return null;
+    let best = null;
     for (const state of trackedStates) {
-      if (!state.view) continue;
+      if (["removed", "superseded", "skipped"].includes(state.status)) continue;
       const sameContainer = state.containerElement === location.containerElement;
       const samePost = location.postKey && state.postKey === location.postKey;
       if (!canReuseTranslationView({
@@ -341,9 +492,10 @@
         sourceConnected: state.element.isConnected,
       })) continue;
       if (state.targetIndex !== location.targetIndex) continue;
-      if (textsRepresentSamePost(state.plainText, plainText)) return state;
+      if (!textsRepresentSamePost(state.plainText, plainText)) continue;
+      if (!best || Number(state.requestId) > Number(best.requestId)) best = state;
     }
-    return null;
+    return best;
   }
 
   function textsRepresentSamePost(previousText, nextText) {
@@ -368,101 +520,91 @@
       .test(normalizePlainText(value));
   }
 
+  function isExpansionLabel(value) {
+    return /^(?:Показать\s+(?:ещё|еще|больше)|Show\s+more)$/iu
+      .test(normalizePlainText(value));
+  }
+
   function matchingExpansionPrefetch(state) {
     if (!state.postKey) return null;
     const entry = expansionPrefetches.get(state.postKey);
-    return entry?.plainText === state.plainText && entry?.html === state.html ? entry : null;
+    return entry?.request?.plainText === state.plainText ? entry : null;
   }
 
   function waitForExpansionPrefetch(state, entry) {
     state.status = "loading";
-    if (entry.status === "queued") {
-      const index = expansionPrefetchQueue.indexOf(entry);
-      if (index > 0) {
-        expansionPrefetchQueue.splice(index, 1);
-        expansionPrefetchQueue.unshift(entry);
-      }
-    }
+    scheduleInitialLoading(state);
+    entry.priority = Math.min(entry.priority, translationPriority(state));
 
     entry.promise.then((resolved) => {
       if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
-      if (
-        resolved.status === "ready"
-        && resolved.plainText === state.plainText
-        && resolved.html === state.html
-      ) {
-        applyTranslation(state, resolved.result);
+      if (resolved.status === "ready" && resolved.request && resolved.result) {
+        applyTranslation(state, resolved.result, resolved.request, {
+          collapsible: state.isExpandable && !state.expandTranslationOnApply,
+          expanded: isTranslationExpanded(state),
+        });
         return;
       }
-      enqueueState(state);
+      markForRetry(
+        state,
+        resolved.error?.retryAfterMs,
+        resolved.errorKind || "full-text",
+      );
     });
   }
 
   function ensureExpansionPrefetch(state) {
-    if (!enabled || !state.isExpandable || !state.postKey) return;
-    if (expansionPrefetches.has(state.postKey)) return;
+    const existing = expansionPrefetches.get(state.postKey);
+    if (existing && existing.status !== "error") return existing;
+    if (existing) expansionPrefetches.delete(state.postKey);
 
-    let resolveEntry;
     const entry = {
       postKey: state.postKey,
       truncatedBase: expansionBase(state.plainText),
-      status: "queued",
-      plainText: "",
-      html: "",
+      status: "fetching",
+      priority: translationPriority(state),
+      request: null,
       result: null,
-      promise: new Promise((resolve) => {
-        resolveEntry = resolve;
-      }),
-      resolve: null,
+      error: null,
+      errorKind: "",
+      promise: null,
     };
-    entry.resolve = resolveEntry;
     expansionPrefetches.set(entry.postKey, entry);
-    expansionPrefetchQueue.push(entry);
+    entry.promise = prepareExpansionPrefetch(entry);
     trimExpansionPrefetches();
-    runExpansionPrefetchQueue();
+    return entry;
   }
 
-  async function runExpansionPrefetchQueue() {
-    if (expansionPrefetchActive) return;
-    expansionPrefetchActive = true;
-
+  async function prepareExpansionPrefetch(entry) {
     try {
-      while (enabled && expansionPrefetchQueue.length) {
-        const entry = expansionPrefetchQueue.shift();
-        if (expansionPrefetches.get(entry.postKey) !== entry) continue;
-        entry.status = "loading";
-
-        try {
-          const fullText = await fetchFullPostText(entry.postKey, entry.truncatedBase);
-          const request = buildTextRequest(fullText);
-          const response = await runtimeMessage({
-            type: "TRANSLATE_BATCH",
-            items: [{
-              id: `prefetch:${entry.postKey}`,
-              html: request.html,
-              plainText: request.plainText,
-            }],
-          });
-          const result = response?.ok ? response.results?.[0] : null;
-          if (!result?.translatedHtml) throw new Error(response?.error || "Не удалось подготовить полный перевод.");
-          entry.plainText = request.plainText;
-          entry.html = request.html;
-          entry.result = result;
-          entry.status = "ready";
-        } catch (error) {
-          entry.status = "error";
-          console.debug("[X Translator] Не удалось заранее перевести продолжение:", error);
-        } finally {
-          entry.resolve(entry);
-          trimExpansionPrefetches();
-        }
+      try {
+        entry.request = await fetchFullPostRequest(entry.postKey, entry.truncatedBase);
+      } catch (error) {
+        error.xtrKind = "full-text";
+        throw error;
       }
+
+      entry.status = "queued";
+      entry.result = await requestTranslation({
+        id: `full:${normalizeStatusPath(entry.postKey)}`,
+        html: entry.request.html,
+        plainText: entry.request.plainText,
+      }, () => entry.priority, () => {
+        entry.status = "loading";
+      });
+      entry.status = "ready";
+    } catch (error) {
+      entry.status = "error";
+      entry.error = error;
+      entry.errorKind = error?.xtrKind || "translation";
+      console.debug("[X Translator] Не удалось подготовить полный пост:", error);
     } finally {
-      expansionPrefetchActive = false;
+      trimExpansionPrefetches();
     }
+    return entry;
   }
 
-  async function fetchFullPostText(postKey, truncatedBase) {
+  async function fetchFullPostRequest(postKey, truncatedBase) {
     const url = new URL(postKey, location.origin);
     const response = await fetch(url.href, {
       cache: "force-cache",
@@ -480,12 +622,12 @@
     ));
     const root = article || fetchedDocument.body;
     const candidates = [...root.querySelectorAll('[dir="auto"]')]
-      .map((element) => normalizePlainText(element.textContent))
-      .filter((text) => text.length > truncatedBase.length + 8)
-      .filter((text) => expansionBase(text).startsWith(truncatedBase))
-      .sort((left, right) => right.length - left.length);
+      .map((element) => ({ element, text: normalizePlainText(element.textContent) }))
+      .filter(({ text }) => text.length > truncatedBase.length + 8)
+      .filter(({ text }) => expansionBase(text).startsWith(truncatedBase))
+      .sort((left, right) => right.text.length - left.text.length);
     if (!candidates[0]) throw new Error("X не отдал полный текст поста.");
-    return candidates[0];
+    return buildRequest(candidates[0].element, true);
   }
 
   function normalizeStatusPath(value) {
@@ -496,30 +638,22 @@
     }
   }
 
-  function buildTextRequest(value) {
-    const plainText = normalizePlainText(value);
-    const tokens = [];
-    return {
-      plainText,
-      html: `<div>${serializeText(plainText, tokens)}</div>`,
-      tokens,
-    };
-  }
-
   function trimExpansionPrefetches() {
     while (expansionPrefetches.size > EXPANSION_PREFETCH_LIMIT) {
       const oldestKey = expansionPrefetches.keys().next().value;
       const entry = expansionPrefetches.get(oldestKey);
-      if (["queued", "loading"].includes(entry?.status)) break;
+      if (["fetching", "queued", "loading"].includes(entry?.status)) break;
       expansionPrefetches.delete(oldestKey);
     }
   }
 
-  function buildRequest(element) {
+  function buildRequest(element, preferTextContent = false) {
     const tokens = [];
     const html = [...element.childNodes].map((node) => serializeNode(node, tokens)).join("");
     return {
-      plainText: normalizePlainText(element.innerText || element.textContent),
+      plainText: normalizePlainText(
+        preferTextContent ? element.textContent : element.innerText || element.textContent,
+      ),
       html: `<div>${html}</div>`,
       tokens,
     };
@@ -564,82 +698,85 @@
     return `<span class="notranslate" data-xtr-token="${id}">${escapeHtml(value)}</span>`;
   }
 
-  function scheduleFlush(delay = 90) {
-    if (flushTimer !== null || flushInFlight) return;
+  function requestTranslation(item, priority, onStart) {
+    return new Promise((resolve, reject) => {
+      queue.push({ item, priority, onStart, resolve, reject });
+      scheduleFlush();
+    });
+  }
+
+  function scheduleFlush(delay = 0) {
+    if (flushTimer !== null) return;
     flushTimer = setTimeout(() => {
       flushTimer = null;
       flushQueue();
     }, delay);
   }
 
-  async function flushQueue() {
-    if (!enabled || !queue.length || flushInFlight) return;
-    flushInFlight = true;
+  function flushQueue() {
+    if (!enabled) return;
+    queue.sort((left, right) => translationJobPriority(left) - translationJobPriority(right));
+    const concurrency = hasPrimaryFullPostFetch()
+      ? Math.max(1, TRANSLATION_CONCURRENCY - 1)
+      : TRANSLATION_CONCURRENCY;
 
-    const batch = [];
-    let characters = 0;
-    const priorities = new Map();
-    const priorityFor = (state) => {
-      if (!priorities.has(state.element)) {
-        priorities.set(state.element, elementPriority(state.element));
-      }
-      return priorities.get(state.element);
-    };
-    queue.sort((left, right) => priorityFor(left) - priorityFor(right));
-    while (queue.length && batch.length < BATCH_SIZE) {
-      const state = queue.shift();
-      if (!state.element.isConnected || state.status !== "queued") continue;
-      if (batch.length && characters + state.html.length > BATCH_CHARACTERS) {
-        queue.unshift(state);
-        break;
-      }
-      characters += state.html.length;
-      state.status = "loading";
-      batch.push(state);
-    }
+    while (queue.length && activeTranslations < concurrency) {
+      const job = queue.shift();
+      activeTranslations += 1;
+      job.onStart?.();
 
-    if (!batch.length) {
-      flushInFlight = false;
-      return;
-    }
-
-    try {
-      const response = await runtimeMessage({
+      runtimeMessage({
         type: "TRANSLATE_BATCH",
-        items: batch.map((state) => ({
-          id: state.requestId,
-          html: state.html,
-          plainText: state.plainText,
-        })),
+        items: [job.item],
+      }).then((response) => {
+        const result = response?.ok ? response.results?.[0] : null;
+        if (!result?.translatedHtml) {
+          const error = new Error(response?.error || "Переводчик не вернул результат.");
+          error.retryAfterMs = Number(response?.retryAfterMs || 0);
+          error.xtrKind = "translation";
+          throw error;
+        }
+        job.resolve(result);
+      }).catch(job.reject).finally(() => {
+        activeTranslations -= 1;
+        if (queue.length) scheduleFlush();
       });
-
-      if (!response?.ok) {
-        batch.forEach((state) => markForRetry(state, response?.retryAfterMs));
-        return;
-      }
-
-      const byId = new Map((response.results || []).map((result) => [String(result.id), result]));
-      batch.forEach((state) => applyTranslation(state, byId.get(state.requestId)));
-    } catch (error) {
-      console.debug("[X Translator] Перевод временно недоступен:", error);
-      batch.forEach((state) => markForRetry(state));
-    } finally {
-      flushInFlight = false;
-      if (queue.length) scheduleFlush(20);
     }
   }
 
-  function markForRetry(state, retryAfterMs = 0) {
+  function hasPrimaryFullPostFetch() {
+    return [...expansionPrefetches.values()].some((entry) => (
+      entry.status === "fetching" && entry.priority < -1_000
+    ));
+  }
+
+  function translationJobPriority(job) {
+    const value = typeof job.priority === "function" ? job.priority() : job.priority;
+    return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+  }
+
+  function translationPriority(state) {
+    let priority = elementPriority(state.element);
+    const postPath = normalizeStatusPath(state.postKey);
+    const currentPath = normalizeStatusPath(location.href);
+    if (postPath && postPath === currentPath) priority -= 10_000;
+    if (state.targetIndex > 0) priority += state.targetIndex * 250;
+    return priority;
+  }
+
+  function markForRetry(state, retryAfterMs = 0, errorKind = "translation") {
     if (!state || ["removed", "superseded", "translated", "skipped"].includes(state.status)) return;
     state.retryCount = (state.retryCount || 0) + 1;
     const backoff = Math.min(RETRY_DELAY * (2 ** (state.retryCount - 1)), MAX_RETRY_DELAY);
     const delay = Math.max(backoff, Number(retryAfterMs || 0));
     state.status = "error";
+    state.errorKind = errorKind;
     state.retryAt = Date.now() + delay;
     if (!state.view) restoreNativeTranslationRows(state);
     showTranslationError(state);
     setTimeout(() => {
       if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
+      resetFailedExpansion(state);
       if (state.view) {
         clearExpansionPending(state.view);
         showExpansionPending(state.view);
@@ -648,7 +785,7 @@
     }, delay + 25);
   }
 
-  function applyTranslation(state, result) {
+  function applyTranslation(state, result, request = state, options = {}) {
     if (!result?.translatedHtml || !state.element.isConnected) {
       markForRetry(state);
       return;
@@ -657,15 +794,18 @@
     clearStatePending(state);
     if (languagesMatch(result.detectedLanguage, TARGET_LANGUAGE)) {
       clearExpansionPending(state.view);
+      releaseSource(state.element);
       removeStateView(state);
       state.status = "skipped";
       return;
     }
 
-    const fragment = renderTranslation(result.translatedHtml, state.tokens);
+    state.translationPlainText = request.plainText;
+    const fragment = renderTranslation(result.translatedHtml, request.tokens || []);
     const renderedText = normalizePlainText(fragment.textContent);
-    if (!renderedText || renderedText.toLocaleLowerCase("ru") === state.plainText.toLocaleLowerCase("ru")) {
+    if (!renderedText || renderedText.toLocaleLowerCase("ru") === request.plainText.toLocaleLowerCase("ru")) {
       clearExpansionPending(state.view);
+      releaseSource(state.element);
       removeStateView(state);
       state.status = "skipped";
       return;
@@ -676,10 +816,22 @@
     translated.setAttribute("data-xtr-owned", "translation");
     translated.setAttribute("lang", TARGET_LANGUAGE);
     translated.setAttribute("dir", "auto");
-    translated.append(fragment);
+    const collapsible = Boolean(options.collapsible && state.collapsedMetrics);
+    const initiallyExpanded = !collapsible || Boolean(options.expanded);
+    const fullContent = collapsible ? document.createElement("span") : null;
+    const expandControl = collapsible ? createTranslatedExpansionControl(state) : null;
+    if (fullContent) {
+      fullContent.setAttribute(FULL_CONTENT_ATTR, "");
+      fullContent.append(fragment);
+      translated.append(fullContent, expandControl);
+    } else {
+      translated.append(fragment);
+    }
+    const shouldReveal = shouldRevealTranslation(state, result);
 
     if (state.view) {
       const view = state.view;
+      finishTranslationReveal(view.translatedElement);
       clearExpansionPending(view);
       if (view.languageLabel) {
         view.languageLabel.textContent = `Исходный язык: ${displayLanguage(result.detectedLanguage)}`;
@@ -688,10 +840,21 @@
       view.translatedElement.replaceWith(translated);
       view.translatedElement = translated;
       view.sourceElement = state.element;
+      view.collapsible = collapsible;
+      view.expanded = initiallyExpanded;
+      view.fullContentElement = fullContent;
+      view.expandControl = expandControl;
+      view.collapsedHeight = state.collapsedMetrics?.contentHeight || 0;
+      view.collapsedTotalHeight = state.collapsedMetrics?.totalHeight || 0;
+      view.sourceExpansionControl = state.sourceExpansionControl;
+      if (expandControl) expansionControls.set(expandControl, view);
+      applyTranslationExpansion(view);
       setOriginalVisible(view, view.showingOriginal);
+      if (!view.showingOriginal && shouldReveal) {
+        revealTranslation(translated);
+      }
       syncNativeTranslationRow(state);
       state.status = "translated";
-      ensureExpansionPrefetch(state);
       return;
     }
 
@@ -702,17 +865,26 @@
       translatedElement: translated,
       showingOriginal: false,
       expansionElement: null,
+      collapsible,
+      expanded: initiallyExpanded,
+      fullContentElement: fullContent,
+      expandControl,
+      collapsedHeight: state.collapsedMetrics?.contentHeight || 0,
+      collapsedTotalHeight: state.collapsedMetrics?.totalHeight || 0,
+      sourceExpansionControl: state.sourceExpansionControl,
       nativeTranslationRows: state.nativeTranslationRows,
     };
+    if (expandControl) expansionControls.set(expandControl, view);
     const meta = createMetaRow(result.detectedLanguage, view);
     view.metaElement = meta;
     state.view = view;
     state.element.before(meta);
     state.element.after(translated);
+    applyTranslationExpansion(view);
     setOriginalVisible(view, false);
+    if (shouldReveal) revealTranslation(translated);
     syncNativeTranslationRow(state);
     state.status = "translated";
-    ensureExpansionPrefetch(state);
   }
 
   function renderTranslation(html, tokens) {
@@ -722,6 +894,308 @@
     const usedTokens = new Set();
     [...root.childNodes].forEach((node) => appendSafeNode(node, fragment, tokens, usedTokens));
     return fragment;
+  }
+
+  function findPostExpansionControl(element, container) {
+    const direct = findExpansionControl(element);
+    if (direct) return direct;
+
+    const parentCandidates = expansionControlCandidates(element.parentElement);
+    if (parentCandidates.length) return nearestExpansionControl(element, parentCandidates);
+    return nearestExpansionControl(element, expansionControlCandidates(container));
+  }
+
+  function expansionControlCandidates(root) {
+    if (!root) return [];
+    return [...root.querySelectorAll('button, a, [role="button"]')]
+      .filter((candidate) => !candidate.closest(OWNED_SELECTOR))
+      .filter((candidate) => isExpansionLabel(candidate.textContent));
+  }
+
+  function nearestExpansionControl(element, candidates) {
+    const targetRect = element.getBoundingClientRect();
+    return [...candidates].sort((left, right) => {
+      const score = (candidate) => {
+        const rect = candidate.getBoundingClientRect();
+        const beforePenalty = rect.bottom < targetRect.top ? 10_000 : 0;
+        return beforePenalty + Math.abs(rect.top - targetRect.bottom);
+      };
+      return score(left) - score(right);
+    })[0] || null;
+  }
+
+  function measureCollapsedSource(element, expansionControl) {
+    const style = window.getComputedStyle?.(element);
+    const fontSize = Number.parseFloat(style?.fontSize) || 15;
+    const lineHeight = Number.parseFloat(style?.lineHeight) || fontSize * 1.25;
+    const sourceHeight = element.getBoundingClientRect().height || element.scrollHeight || lineHeight;
+    const controlInsideSource = Boolean(expansionControl && element.contains(expansionControl));
+    const controlHeight = expansionControl?.getBoundingClientRect().height || lineHeight;
+    return {
+      contentHeight: controlInsideSource
+        ? Math.max(lineHeight, sourceHeight - controlHeight)
+        : sourceHeight,
+      totalHeight: controlInsideSource ? sourceHeight : sourceHeight + controlHeight,
+      control: expansionControl?.cloneNode(true) || null,
+    };
+  }
+
+  function findExpansionControl(element) {
+    return [...element.querySelectorAll('button, a, [role="button"]')]
+      .find((candidate) => isExpansionLabel(candidate.textContent)) || null;
+  }
+
+  function createTranslatedExpansionControl(state) {
+    const control = state.collapsedMetrics?.control?.cloneNode(true)
+      || document.createElement("button");
+    stripConflictingAttributes(control, true);
+    control.setAttribute(EXPAND_CONTROL_ATTR, "");
+    control.setAttribute("data-xtr-owned", "expand-control");
+    control.setAttribute("role", "button");
+    control.setAttribute("tabindex", "0");
+    control.removeAttribute("href");
+    control.removeAttribute("target");
+    if (control.tagName === "BUTTON") control.type = "button";
+    if (!normalizePlainText(control.textContent)) control.textContent = "Показать ещё";
+    return control;
+  }
+
+  function applyTranslationExpansion(view) {
+    const content = view?.fullContentElement;
+    const control = view?.expandControl;
+    if (!view?.collapsible || !content || !control) return;
+
+    if (view.expanded) {
+      content.style.removeProperty("max-height");
+      content.style.removeProperty("overflow");
+      view.translatedElement.style.removeProperty("height");
+      view.translatedElement.style.removeProperty("overflow");
+      control.hidden = true;
+      view.translatedElement.removeAttribute("data-xtr-collapsed");
+      return;
+    }
+
+    content.style.maxHeight = `${Math.max(1, view.collapsedHeight)}px`;
+    content.style.overflow = "hidden";
+    view.translatedElement.style.height = `${Math.max(1, view.collapsedTotalHeight)}px`;
+    view.translatedElement.style.overflow = "hidden";
+    control.hidden = false;
+    view.translatedElement.setAttribute("data-xtr-collapsed", "true");
+  }
+
+  function translationExpansionKey(state) {
+    const postPath = normalizeStatusPath(state?.postKey);
+    return postPath ? `${postPath}\u0000${state?.targetIndex ?? -1}` : "";
+  }
+
+  function isTranslationExpanded(state) {
+    const key = translationExpansionKey(state);
+    return Boolean(key && expandedPostTranslations.has(key));
+  }
+
+  function rememberTranslationExpanded(state) {
+    const key = translationExpansionKey(state);
+    if (!key) return;
+    expandedPostTranslations.add(key);
+    while (expandedPostTranslations.size > 500) {
+      expandedPostTranslations.delete(expandedPostTranslations.values().next().value);
+    }
+  }
+
+  function expandTranslatedView(view) {
+    if (!view?.collapsible || view.expanded || !view.translatedElement?.isConnected) return;
+    finishTranslationReveal(view.translatedElement);
+
+    const content = view.fullContentElement;
+    const boundary = content.getBoundingClientRect().top + content.clientHeight - 0.5;
+    const continuation = tokenizeTranslationWords(view.translatedElement)
+      .filter((token) => content.contains(token))
+      .filter((token) => token.getBoundingClientRect().top >= boundary - 1);
+
+    rememberTranslationExpanded(view.owner);
+    view.expanded = true;
+    revealTranslation(view.translatedElement, {
+      tokens: continuation,
+      beforeAnimate: () => applyTranslationExpansion(view),
+    });
+  }
+
+  function revealTranslation(element, options = {}) {
+    finishTranslationReveal(element);
+    const beforeAnimate = options.beforeAnimate;
+    if (
+      !element?.isConnected
+      || element.hidden
+      || window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+    ) {
+      beforeAnimate?.();
+      return;
+    }
+
+    const tokens = options.tokens || tokenizeTranslationWords(element);
+    if (!tokens.length) {
+      beforeAnimate?.();
+      return;
+    }
+    const stagger = tokens.length > 1
+      ? Math.min(
+        BLUR_TEXT_STAGGER,
+        (BLUR_TEXT_MAX_DURATION - BLUR_TEXT_DURATION) / (tokens.length - 1),
+      )
+      : 0;
+    const originalStyles = new Map(tokens.map((token) => [token, {
+      filter: token.style.getPropertyValue("filter"),
+      filterPriority: token.style.getPropertyPriority("filter"),
+      opacity: token.style.getPropertyValue("opacity"),
+      opacityPriority: token.style.getPropertyPriority("opacity"),
+      transform: token.style.getPropertyValue("transform"),
+      transformPriority: token.style.getPropertyPriority("transform"),
+    }]));
+
+    tokens.forEach((token) => {
+      token.style.opacity = "0";
+      token.style.filter = `blur(${BLUR_TEXT_AMOUNT}px)`;
+      token.style.transform = `translateY(${BLUR_TEXT_OFFSET}px)`;
+    });
+    beforeAnimate?.();
+    void element.offsetWidth;
+    element.setAttribute("data-xtr-reveal", "blur-text");
+
+    const animations = tokens.map((token, index) => token.animate(
+      [
+        {
+          opacity: 0,
+          filter: `blur(${BLUR_TEXT_AMOUNT}px)`,
+          transform: `translateY(${BLUR_TEXT_OFFSET}px)`,
+        },
+        { opacity: 1, filter: "blur(0px)", transform: "translateY(0)" },
+      ],
+      {
+        duration: BLUR_TEXT_DURATION,
+        delay: index * stagger,
+        easing: BLUR_TEXT_EASING,
+        fill: "forwards",
+      },
+    ));
+    const active = { animations, originalStyles, tokens, settleFrame: null };
+    revealAnimations.set(element, active);
+
+    Promise.all(animations.map((animation) => animation.finished.catch(() => undefined)))
+      .then(() => {
+        if (revealAnimations.get(element) !== active) return;
+        active.settleFrame = requestAnimationFrame(() => {
+          active.settleFrame = requestAnimationFrame(() => completeTranslationReveal(element));
+        });
+      });
+  }
+
+  function tokenizeTranslationWords(element) {
+    const textNodes = [];
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (
+        /\S/u.test(node.nodeValue || "")
+        && !node.parentElement?.closest?.("[data-xtr-blur-token]")
+        && !node.parentElement?.closest?.(`[${EXPAND_CONTROL_ATTR}]`)
+      ) {
+        textNodes.push(node);
+      }
+    }
+
+    const tokens = [];
+    for (const textNode of textNodes) {
+      const fragment = document.createDocumentFragment();
+      for (const part of (textNode.nodeValue || "").split(/(\s+)/u)) {
+        if (!part) continue;
+        if (/^\s+$/u.test(part)) {
+          fragment.append(document.createTextNode(part));
+          continue;
+        }
+        const token = document.createElement("span");
+        token.setAttribute("data-xtr-blur-token", "");
+        token.textContent = part;
+        fragment.append(token);
+        tokens.push(token);
+      }
+      textNode.replaceWith(fragment);
+    }
+    return [...element.querySelectorAll("[data-xtr-blur-token], img")]
+      .filter((token) => !token.closest(`[${EXPAND_CONTROL_ATTR}]`));
+  }
+
+  function completeTranslationReveal(element) {
+    const active = revealAnimations.get(element);
+    if (!active) return;
+    active.tokens.forEach((token) => {
+      token.style.opacity = "1";
+      token.style.filter = "none";
+      token.style.transform = "none";
+    });
+    active.animations.forEach((animation) => animation.cancel());
+    active.tokens.forEach((token) => {
+      const original = active.originalStyles.get(token);
+      restoreInlineProperty(token, "opacity", original?.opacity, original?.opacityPriority);
+      restoreInlineProperty(token, "filter", original?.filter, original?.filterPriority);
+      restoreInlineProperty(token, "transform", original?.transform, original?.transformPriority);
+    });
+    revealAnimations.delete(element);
+    element.removeAttribute("data-xtr-reveal");
+  }
+
+  function restoreInlineProperty(element, property, value = "", priority = "") {
+    if (value) {
+      element.style.setProperty(property, value, priority);
+    } else {
+      element.style.removeProperty(property);
+    }
+  }
+
+  function finishTranslationReveal(element) {
+    if (!element) return;
+    const active = revealAnimations.get(element);
+    if (active) {
+      if (active.settleFrame !== null) cancelAnimationFrame(active.settleFrame);
+      completeTranslationReveal(element);
+    }
+    element.removeAttribute("data-xtr-reveal");
+  }
+
+  function shouldRevealTranslation(state, result) {
+    const keys = translationPresentationKeys(state);
+    const alreadyPresented = keys.some((key) => presentedTranslations.has(key));
+    for (const key of keys) {
+      presentedTranslations.add(key);
+      releasedSources.delete(key);
+    }
+    while (presentedTranslations.size > 1_000) {
+      presentedTranslations.delete(presentedTranslations.values().next().value);
+    }
+    return result.cached !== true && !alreadyPresented;
+  }
+
+  function translationPresentationKeys(state) {
+    const contentKey = translationContentKey(state);
+    if (!contentKey) return [];
+    const postPath = normalizeStatusPath(state?.postKey);
+    return postPath
+      ? [contentKey, `${postPath}\u0000${contentKey}`]
+      : [contentKey];
+  }
+
+  function translationContentKey(state) {
+    const text = normalizePlainText(state?.translationPlainText || state?.plainText);
+    if (!text) return "";
+    return `${state?.targetIndex ?? -1}\u0000${text}`;
+  }
+
+  function rememberSourceReleased(state) {
+    const key = translationContentKey(state);
+    if (!key) return;
+    releasedSources.add(key);
+    while (releasedSources.size > 1_000) {
+      releasedSources.delete(releasedSources.values().next().value);
+    }
   }
 
   function appendSafeNode(source, target, tokens, usedTokens) {
@@ -766,6 +1240,7 @@
       node.removeAttribute("data-testid");
       node.removeAttribute("aria-describedby");
       node.removeAttribute("data-xtr-original-hidden");
+      node.removeAttribute(SOURCE_READY_ATTR);
       node.removeAttribute(NATIVE_TRANSLATION_HIDDEN_ATTR);
     });
   }
@@ -838,9 +1313,14 @@
 
   function scheduleInitialLoading(state) {
     if (state.view || state.pendingElement || state.loadingTimer !== null) return;
-    const delay = state.retryCount > 0 ? 0 : INITIAL_LOADING_DELAY;
+    if (!state.loadingDeadline) {
+      const initialDelay = state.retryCount > 0 ? 0 : INITIAL_LOADING_DELAY;
+      state.loadingDeadline = Date.now() + initialDelay;
+    }
+    const delay = Math.max(0, state.loadingDeadline - Date.now());
     state.loadingTimer = setTimeout(() => {
       state.loadingTimer = null;
+      state.loadingDeadline = 0;
       if (
         !enabled
         || !state.element.isConnected
@@ -853,6 +1333,9 @@
 
   function showInitialLoading(state) {
     if (state.view || state.pendingElement) return;
+    setEarlyGuard(false);
+    rememberSourceReleased(state);
+    releaseSource(state.element);
     const row = createMetaStatusRow();
     const text = row.querySelector('[data-xtr-status-text]');
     text.textContent = "Перевожу…";
@@ -899,6 +1382,8 @@
 
   function showTranslationError(state) {
     clearStatePending(state);
+    rememberSourceReleased(state);
+    releaseSource(state.element);
 
     if (state.view) {
       clearExpansionPending(state.view);
@@ -924,7 +1409,10 @@
   }
 
   function appendRetryContent(container, state) {
-    container.append(document.createTextNode("Не удалось перевести · "));
+    const message = state.errorKind === "full-text"
+      ? "Не удалось получить полный текст · "
+      : "Не удалось перевести · ";
+    container.append(document.createTextNode(message));
     const retry = document.createElement("button");
     retry.type = "button";
     retry.className = "xtr-inline-action";
@@ -935,6 +1423,7 @@
       if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
       state.retryAt = 0;
       state.status = "error";
+      resetFailedExpansion(state);
       if (state.view) {
         clearExpansionPending(state.view);
         showExpansionPending(state.view);
@@ -944,12 +1433,19 @@
     container.append(retry);
   }
 
+  function resetFailedExpansion(state) {
+    if (!state?.postKey) return;
+    const entry = expansionPrefetches.get(state.postKey);
+    if (entry?.status === "error") expansionPrefetches.delete(state.postKey);
+  }
+
   function clearStatePending(state) {
     if (!state) return;
     if (state.loadingTimer !== null) {
       clearTimeout(state.loadingTimer);
       state.loadingTimer = null;
     }
+    state.loadingDeadline = 0;
     state.pendingElement?.remove();
     state.pendingElement = null;
   }
@@ -959,10 +1455,15 @@
     view.showingOriginal = Boolean(visible);
     const text = visible ? "Показать перевод" : "Показать оригинал";
     if (visible) {
+      finishTranslationReveal(view.translatedElement);
+      releaseSource(view.sourceElement);
       view.sourceElement.removeAttribute("data-xtr-original-hidden");
+      view.sourceExpansionControl?.removeAttribute?.(NATIVE_EXPANSION_HIDDEN_ATTR);
       view.translatedElement.hidden = true;
     } else {
+      holdSource(view.sourceElement);
       view.sourceElement.setAttribute("data-xtr-original-hidden", "true");
+      view.sourceExpansionControl?.setAttribute?.(NATIVE_EXPANSION_HIDDEN_ATTR, "true");
       view.translatedElement.hidden = false;
     }
     if (view.expansionElement) view.expansionElement.hidden = visible;
@@ -1024,18 +1525,86 @@
     const view = state.view;
     if (view && view.owner !== state) return;
     restoreNativeTranslationRows(state);
-    if (!view) return;
+    if (!view) {
+      releaseSource(state.element);
+      return;
+    }
     clearExpansionPending(view);
     view.metaElement?.remove();
+    finishTranslationReveal(view.translatedElement);
     view.translatedElement?.remove();
     view.sourceElement?.removeAttribute?.("data-xtr-original-hidden");
+    view.sourceExpansionControl?.removeAttribute?.(NATIVE_EXPANSION_HIDDEN_ATTR);
+    releaseSource(view.sourceElement);
     state.view = null;
   }
 
+  function ensureViewMounted(state) {
+    const view = state?.view;
+    const source = state?.element;
+    if (!view || view.owner !== state || !source?.isConnected) return;
+
+    const parent = source.parentNode;
+    if (!parent) return;
+    let repaired = false;
+
+    if (view.metaElement.parentNode !== parent || view.metaElement.nextSibling !== source) {
+      source.before(view.metaElement);
+      repaired = true;
+    }
+    if (
+      view.translatedElement.parentNode !== parent
+      || source.nextSibling !== view.translatedElement
+    ) {
+      source.after(view.translatedElement);
+      repaired = true;
+    }
+    if (
+      view.expansionElement
+      && (
+        view.expansionElement.parentNode !== parent
+        || view.translatedElement.nextSibling !== view.expansionElement
+      )
+    ) {
+      view.translatedElement.after(view.expansionElement);
+      repaired = true;
+    }
+
+    view.sourceElement = source;
+    if (repaired) finishTranslationReveal(view.translatedElement);
+    setOriginalVisible(view, view.showingOriginal);
+  }
+
+  function setEarlyGuard(active) {
+    if (earlyGuardTimer !== null) {
+      clearTimeout(earlyGuardTimer);
+      earlyGuardTimer = null;
+    }
+
+    document.documentElement?.toggleAttribute(EARLY_GUARD_ATTR, Boolean(active));
+    if (!active) return;
+
+    earlyGuardTimer = setTimeout(() => {
+      earlyGuardTimer = null;
+      document.documentElement?.removeAttribute(EARLY_GUARD_ATTR);
+    }, EARLY_GUARD_TIMEOUT);
+  }
+
+  function holdSource(element) {
+    element?.removeAttribute?.(SOURCE_READY_ATTR);
+  }
+
+  function releaseSource(element) {
+    element?.setAttribute?.(SOURCE_READY_ATTR, "true");
+  }
+
   function removeAllTranslations() {
-    queue.splice(0, queue.length);
-    expansionPrefetchQueue.splice(0, expansionPrefetchQueue.length);
+    const queued = queue.splice(0, queue.length);
+    queued.forEach((job) => job.reject(new Error("Перевод выключен.")));
     expansionPrefetches.clear();
+    expandedPostTranslations.clear();
+    presentedTranslations.clear();
+    releasedSources.clear();
     for (const state of [...trackedStates]) {
       cleanupState(state);
       states.delete(state.element);

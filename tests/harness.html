@@ -11,7 +11,9 @@
       .author { margin-bottom: 5px; font-weight: 700; }
       [data-testid="tweetText"] { white-space: pre-wrap; font-size: 17px; line-height: 22px; }
       a { color: #1d9bf0; text-decoration: none; }
+      .emoji { width: 1em; height: 1em; vertical-align: -0.15em; }
       .quote { margin: 12px 0 0 35px; border: 1px solid #536471; border-radius: 12px; padding: 12px; }
+      .harness-controls { display: flex; gap: 8px; margin-bottom: 16px; }
     </style>
     <script>
       const changeListeners = [];
@@ -30,12 +32,17 @@
         runtime: {
           lastError: null,
           sendMessage(message, callback) {
+            const cached = new URLSearchParams(location.search).has("cached");
+            const requestHistory = JSON.parse(document.documentElement.getAttribute("data-harness-requests") || "[]");
+            requestHistory.push(message.items.map((item) => item.plainText));
+            document.documentElement.setAttribute("data-harness-requests", JSON.stringify(requestHistory));
             xtrHarnessEvents.push({ type: "request", at: Date.now(), texts: message.items.map((item) => item.plainText) });
             const dictionary = new Map([
-              ["Hello @alice!\nRead https://example.com #news 🚀", "Привет, @alice!\nПрочитай https://example.com #news 🚀"],
+              ["Hello @alice!\nRead https://example.com #news 🚀", "Привет, @alice!\nПрочитай https://example.com #news 🚀 🔥"],
               ["This quoted post appeared later.", "Этот цитируемый пост появился позже."],
+              ["This comment loaded after the main post.", "Этот комментарий загрузился после основного поста."],
               ["Public post uses semantic markup.", "Публичный пост использует семантическую разметку."],
-              ["This expandable post starts right here.\nПоказать ещё", "Этот раскрываемый пост начинается прямо здесь.\nПоказать ещё"],
+              ["This expandable post starts right here.", "Этот раскрываемый пост начинается прямо здесь."],
               ["This expandable post starts right here. This continuation appears after expansion.", "Этот раскрываемый пост начинается прямо здесь. Продолжение появилось после раскрытия."],
             ]);
             setTimeout(() => {
@@ -59,10 +66,15 @@
                       html = html.replace(/\n/g, "<br>");
                     }
                   }
-                  return { id: item.id, translatedHtml: html, detectedLanguage: "en" };
+                  return {
+                    id: item.id,
+                    translatedHtml: html,
+                    detectedLanguage: "en",
+                    cached,
+                  };
                 }),
               });
-            }, 1500);
+            }, cached ? 50 : 1500);
           },
         },
         storage: {
@@ -74,10 +86,15 @@
   </head>
   <body>
     <main id="feed">
-      <article data-testid="tweet">
+      <div class="harness-controls">
+        <button type="button" data-demo-remove-owned>Удалить узлы перевода</button>
+        <button type="button" data-demo-rerender-main>Перерендерить пост и добавить комментарий</button>
+      </div>
+      <article id="main-post" data-testid="tweet">
         <div class="author">Alice <span style="color:#71767b">@alice</span></div>
+        <a href="/alice/status/100"><time>now</time></a>
         <div data-testid="tweetText" lang="en">Hello <a href="/alice">@alice</a>!
-Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/news">#news</a> 🚀</div>
+Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/news">#news</a> 🚀 <img class="emoji" alt="🔥" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Ctext y='16' font-size='16'%3E%F0%9F%94%A5%3C/text%3E%3C/svg%3E"></div>
       </article>
       <article data-tweet-id="123" itemscope itemtype="https://schema.org/SocialMediaPosting">
         <meta itemprop="articleBody" content="Public post uses semantic markup.">
@@ -87,14 +104,71 @@ Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/new
       <article id="expandable-post" data-testid="tweet">
         <div class="author">Expandable <span style="color:#71767b">@longpost</span></div>
         <a href="/longpost/status/123456"><time>now</time></a>
-        <div data-testid="tweetText" lang="en">This expandable post starts right here.
-<a href="#" data-demo-show-more>Показать ещё</a></div>
+        <div data-testid="tweetText" lang="en">This expandable post starts right here.</div>
+        <a href="#" data-demo-show-more>Показать ещё</a>
       </article>
     </main>
     <script src="../shared.js"></script>
     <script src="../content.js"></script>
     <script>
+      new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (
+            mutation.type === "attributes"
+            && mutation.target.getAttribute("data-xtr-reveal") === "blur-text"
+          ) {
+            const post = mutation.target.closest("article")?.id || "unknown";
+            const counts = JSON.parse(document.documentElement.getAttribute("data-harness-reveal-counts") || "{}");
+            counts[post] = (counts[post] || 0) + 1;
+            document.documentElement.setAttribute("data-harness-reveal-counts", JSON.stringify(counts));
+            xtrHarnessEvents.push({
+              type: "reveal-start",
+              at: Date.now(),
+              post,
+            });
+          }
+        }
+      }).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-xtr-reveal"],
+        subtree: true,
+      });
+
       document.addEventListener("click", (event) => {
+        const removeOwned = event.target.closest?.("[data-demo-remove-owned]");
+        if (removeOwned) {
+          const article = document.getElementById("main-post");
+          article.querySelectorAll('[data-xtr-owned]').forEach((node) => node.remove());
+          article.querySelector('[data-testid="tweetText"]')
+            ?.removeAttribute("data-xtr-original-hidden");
+          xtrHarnessEvents.push({ type: "owned-removed", at: Date.now() });
+          return;
+        }
+
+        const rerenderMain = event.target.closest?.("[data-demo-rerender-main]");
+        if (rerenderMain) {
+          const article = document.getElementById("main-post");
+          const source = article.querySelector('[data-testid="tweetText"]');
+          const replacement = source.cloneNode(true);
+          replacement.removeAttribute("data-xtr-original-hidden");
+          replacement.removeAttribute("data-xtr-source-ready");
+          source.replaceWith(replacement);
+
+          if (!document.getElementById("late-comment")) {
+            const comment = document.createElement("article");
+            comment.id = "late-comment";
+            comment.setAttribute("data-testid", "tweet");
+            comment.innerHTML = `
+              <div class="author">Carol <span style="color:#71767b">@carol</span></div>
+              <a href="/carol/status/200"><time>now</time></a>
+              <div data-testid="tweetText" lang="en">This comment loaded after the main post.</div>
+            `;
+            document.getElementById("feed").append(comment);
+          }
+          xtrHarnessEvents.push({ type: "main-rerendered", at: Date.now() });
+          return;
+        }
+
         const control = event.target.closest?.("[data-demo-show-more]");
         if (!control) return;
         xtrHarnessEvents.push({ type: "expand-click", at: Date.now() });
@@ -106,6 +180,7 @@ Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/new
         original.nextElementSibling?.remove();
         original.removeAttribute("data-xtr-original-hidden");
         original.textContent = "This expandable post starts right here. This continuation appears after expansion.";
+        replacement.querySelector("[data-demo-show-more]")?.remove();
         article.replaceWith(replacement);
       });
 

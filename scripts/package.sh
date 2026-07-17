@@ -16,6 +16,8 @@ FILES=(
   popup.html
   popup.js
   shared.js
+  LICENSE
+  THIRD_PARTY_NOTICES.md
   icons/icon16.png
   icons/icon48.png
   icons/icon128.png

@@ -191,26 +191,21 @@ button {
 .status.success,
 .status.error { animation: status-in 150ms ease-out both; }
 .status.loading {
-  position: relative;
-  color: #71767b;
-}
-
-.status.loading::after {
-  content: attr(data-shimmer-text);
-  position: absolute;
-  top: 9px;
-  right: 0;
-  bottom: 0;
-  left: 0;
+  --popup-shimmer-base: #71767b;
+  --popup-shimmer-highlight: #eff3f4;
   color: transparent;
-  background: linear-gradient(90deg, transparent 0%, #eff3f4 50%, transparent 100%);
-  background-position: -80% 0;
-  background-size: 42% 100%;
-  background-repeat: no-repeat;
+  background-image: linear-gradient(
+    100deg,
+    rgb(239 243 244 / 0) 42%,
+    var(--popup-shimmer-highlight) 50%,
+    rgb(239 243 244 / 0) 58%
+  ), linear-gradient(var(--popup-shimmer-base), var(--popup-shimmer-base));
+  background-position: 120% 0, 0 0;
+  background-repeat: no-repeat, no-repeat;
+  background-size: 220% 100%, 100% 100%;
   background-clip: text;
   -webkit-background-clip: text;
-  pointer-events: none;
-  animation: popup-shimmer 1.45s ease-in-out infinite;
+  animation: popup-shimmer 2.8s linear infinite;
 }
 
 .overview { margin-top: 17px; }
@@ -297,8 +292,8 @@ button {
 }
 
 @keyframes popup-shimmer {
-  from { background-position: -80% 0; }
-  to { background-position: 180% 0; }
+  from { background-position: 120% 0, 0 0; }
+  to { background-position: -120% 0, 0 0; }
 }
 
 @keyframes status-in {
@@ -312,11 +307,24 @@ button {
   .status-card { border-color: #cfd9de; background: #f7f9f9; }
   .status { border-color: #cfd9de; }
   .metric { background: #eff3f4; }
-  .status.loading::after { background-image: linear-gradient(90deg, transparent 0%, #0f1419 50%, transparent 100%); }
+  .status.loading {
+    --popup-shimmer-base: #536471;
+    --popup-shimmer-highlight: #0f1419;
+    background-image: linear-gradient(
+      100deg,
+      rgb(15 20 25 / 0) 42%,
+      var(--popup-shimmer-highlight) 50%,
+      rgb(15 20 25 / 0) 58%
+    ), linear-gradient(var(--popup-shimmer-base), var(--popup-shimmer-base));
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .status.loading::after { display: none; }
+  .status.loading {
+    animation: none;
+    background-image: none;
+    color: var(--popup-shimmer-base);
+  }
   .status.success,
   .status.error { animation: none; }
 }

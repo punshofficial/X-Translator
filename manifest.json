@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "X Translator",
   "description": "Автоматически переводит на русский только тексты постов, ответов и цитат в X.",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "permissions": [
     "storage"
   ],
@@ -39,7 +39,7 @@
         "shared.js",
         "content.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ]
 }

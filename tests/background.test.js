@@ -172,6 +172,41 @@ test("background preserves protected tokens, line breaks, cache and item ids", a
   assert.equal(background.values.translationStatsV1.cacheHits, 1);
 });
 
+test("independent translation messages do not wait for the slowest post", async () => {
+  const background = createBackground({ enabled: true }, async (url, options = {}) => {
+    if (String(url).endsWith("/translator")) return response(200, SESSION_HTML);
+
+    const form = new URLSearchParams(options.body);
+    const text = form.get("text");
+    if (text === "Slow post") await new Promise((resolve) => setTimeout(resolve, 35));
+    return response(200, JSON.stringify([{
+      detectedLanguage: { language: "en" },
+      translations: [{ text: text === "Slow post" ? "Медленный пост" : "Быстрый пост" }],
+    }]));
+  });
+  const completionOrder = [];
+
+  const slow = background.send({
+    type: "TRANSLATE_BATCH",
+    items: [{ id: "slow", html: "<div>Slow post</div>", plainText: "Slow post" }],
+  }).then((result) => {
+    completionOrder.push("slow");
+    return result;
+  });
+  const fast = background.send({
+    type: "TRANSLATE_BATCH",
+    items: [{ id: "fast", html: "<div>Fast post</div>", plainText: "Fast post" }],
+  }).then((result) => {
+    completionOrder.push("fast");
+    return result;
+  });
+
+  const [slowResult, fastResult] = await Promise.all([slow, fast]);
+  assert.equal(slowResult.ok, true);
+  assert.equal(fastResult.ok, true);
+  assert.deepEqual(completionOrder, ["fast", "slow"]);
+});
+
 test("background refreshes an expired Bing session once", async () => {
   let bootstrapCount = 0;
   let postCount = 0;

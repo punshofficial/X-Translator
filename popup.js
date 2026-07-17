@@ -71,7 +71,6 @@ function formatNumber(value) {
 function showStatus(message, type = "") {
   if (statusTimer !== null) clearTimeout(statusTimer);
   status.className = `status ${type}`.trim();
-  status.dataset.shimmerText = type === "loading" ? message : "";
   status.textContent = message;
   status.hidden = false;
   if (type !== "loading") {
@@ -89,7 +88,6 @@ function hideStatus() {
   statusTimer = null;
   status.hidden = true;
   status.textContent = "";
-  status.dataset.shimmerText = "";
   status.className = "status";
 }
 
