@@ -17,6 +17,29 @@ test("languagesMatch compares base language codes", () => {
   assert.equal(core.languagesMatch("", "ru"), false);
 });
 
+test("canReuseTranslationView keeps simultaneous modal copies independent", () => {
+  assert.equal(core.canReuseTranslationView({
+    sameContainer: false,
+    samePost: true,
+    sourceConnected: true,
+  }), false);
+  assert.equal(core.canReuseTranslationView({
+    sameContainer: false,
+    samePost: true,
+    sourceConnected: false,
+  }), true);
+  assert.equal(core.canReuseTranslationView({
+    sameContainer: true,
+    samePost: true,
+    sourceConnected: true,
+  }), true);
+  assert.equal(core.canReuseTranslationView({
+    sameContainer: false,
+    samePost: false,
+    sourceConnected: false,
+  }), false);
+});
+
 test("escapeHtml makes Translator HTML payload safe", () => {
   assert.equal(core.escapeHtml('<a title="x">Tom & Jerry</a>'), "&lt;a title=&quot;x&quot;&gt;Tom &amp; Jerry&lt;/a&gt;");
 });

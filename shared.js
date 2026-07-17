@@ -39,7 +39,13 @@
       || /^\$[A-Z][A-Z0-9_]*$/u.test(value);
   }
 
+  function canReuseTranslationView({ sameContainer, samePost, sourceConnected } = {}) {
+    if (sameContainer) return true;
+    return Boolean(samePost && !sourceConnected);
+  }
+
   global.XTranslatorCore = Object.freeze({
+    canReuseTranslationView,
     escapeHtml,
     isProtectedToken,
     languagesMatch,

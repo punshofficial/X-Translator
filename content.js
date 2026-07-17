@@ -2,6 +2,7 @@
   "use strict";
 
   const {
+    canReuseTranslationView,
     escapeHtml,
     languagesMatch,
     normalizePlainText,
@@ -66,11 +67,7 @@
           ));
       }
       if (urgent) {
-        if (scanTimer !== null) {
-          clearTimeout(scanTimer);
-          scanTimer = null;
-        }
-        scanDocument();
+        scheduleScan(0);
       } else if (shouldScan) {
         scheduleScan(60);
       }
@@ -155,8 +152,9 @@
     });
 
     [...targets]
-      .sort((left, right) => elementPriority(left) - elementPriority(right))
-      .forEach(processTarget);
+      .map((element) => ({ element, priority: elementPriority(element) }))
+      .sort((left, right) => left.priority - right.priority)
+      .forEach(({ element }) => processTarget(element));
   }
 
   function elementPriority(element) {
@@ -327,7 +325,11 @@
       if (!state.view) continue;
       const sameContainer = state.containerElement === location.containerElement;
       const samePost = location.postKey && state.postKey === location.postKey;
-      if (!sameContainer && !samePost) continue;
+      if (!canReuseTranslationView({
+        sameContainer,
+        samePost,
+        sourceConnected: state.element.isConnected,
+      })) continue;
       if (state.targetIndex !== location.targetIndex) continue;
       if (textsRepresentSamePost(state.plainText, plainText)) return state;
     }
@@ -566,7 +568,14 @@
 
     const batch = [];
     let characters = 0;
-    queue.sort((left, right) => elementPriority(left.element) - elementPriority(right.element));
+    const priorities = new Map();
+    const priorityFor = (state) => {
+      if (!priorities.has(state.element)) {
+        priorities.set(state.element, elementPriority(state.element));
+      }
+      return priorities.get(state.element);
+    };
+    queue.sort((left, right) => priorityFor(left) - priorityFor(right));
     while (queue.length && batch.length < BATCH_SIZE) {
       const state = queue.shift();
       if (!state.element.isConnected || state.status !== "queued") continue;
