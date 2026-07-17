@@ -200,11 +200,11 @@
     const fingerprint = `${request.plainText}\u0000${request.html}`;
     const previous = states.get(element);
     if (previous && previous.fingerprint === fingerprint) {
-      if (previous.status === "translated") {
-        syncNativeTranslationRow(previous.view);
+      if (["queued", "loading", "translated"].includes(previous.status)) {
+        syncNativeTranslationRow(previous);
         return;
       }
-      if (["queued", "loading", "skipped"].includes(previous.status)) return;
+      if (previous.status === "skipped") return;
       if (previous.status === "error" && Date.now() < previous.retryAt) return;
     }
 
@@ -214,6 +214,7 @@
       : findAdjacentViewState(element)
         || findContainerViewState(location, request.plainText);
     const reusableView = reusableState?.view || null;
+    const nativeTranslationRows = reusableState?.nativeTranslationRows || new Set();
     const isExpansionReplacement = Boolean(
       reusableState
       && isExpandableText(reusableState.plainText)
@@ -245,6 +246,7 @@
       targetIndex: location.targetIndex,
       postKey: location.postKey,
       isExpandable: isExpandableText(request.plainText),
+      nativeTranslationRows,
     };
     if (reusableView) {
       location.containerElement
@@ -254,6 +256,7 @@
         });
       reusableView.owner = state;
       reusableView.sourceElement = element;
+      reusableView.nativeTranslationRows = nativeTranslationRows;
       if (element.previousElementSibling !== reusableView.metaElement) {
         element.before(reusableView.metaElement);
       }
@@ -267,6 +270,7 @@
     }
     states.set(element, state);
     trackedStates.add(state);
+    syncNativeTranslationRow(state);
 
     const prefetched = matchingExpansionPrefetch(state);
     if (prefetched?.status === "ready") {
@@ -632,6 +636,7 @@
     const delay = Math.max(backoff, Number(retryAfterMs || 0));
     state.status = "error";
     state.retryAt = Date.now() + delay;
+    if (!state.view) restoreNativeTranslationRows(state);
     showTranslationError(state);
     setTimeout(() => {
       if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
@@ -684,7 +689,7 @@
       view.translatedElement = translated;
       view.sourceElement = state.element;
       setOriginalVisible(view, view.showingOriginal);
-      syncNativeTranslationRow(view);
+      syncNativeTranslationRow(state);
       state.status = "translated";
       ensureExpansionPrefetch(state);
       return;
@@ -697,7 +702,7 @@
       translatedElement: translated,
       showingOriginal: false,
       expansionElement: null,
-      nativeTranslationRows: new Set(),
+      nativeTranslationRows: state.nativeTranslationRows,
     };
     const meta = createMetaRow(result.detectedLanguage, view);
     view.metaElement = meta;
@@ -705,7 +710,7 @@
     state.element.before(meta);
     state.element.after(translated);
     setOriginalVisible(view, false);
-    syncNativeTranslationRow(view);
+    syncNativeTranslationRow(state);
     state.status = "translated";
     ensureExpansionPrefetch(state);
   }
@@ -965,15 +970,17 @@
     if (view.buttonElement) view.buttonElement.setAttribute("aria-label", text);
   }
 
-  function syncNativeTranslationRow(view) {
-    if (!view?.sourceElement || !view.metaElement) return;
-    let candidate = view.sourceElement.previousElementSibling;
+  function syncNativeTranslationRow(state) {
+    const sourceElement = state?.element || state?.view?.sourceElement;
+    if (!sourceElement) return;
+    let candidate = sourceElement.previousElementSibling;
 
     for (let steps = 0; candidate && steps < 4; steps += 1) {
       if (isNativeTranslationRow(candidate)) {
         candidate.setAttribute(NATIVE_TRANSLATION_HIDDEN_ATTR, "true");
-        view.nativeTranslationRows ||= new Set();
-        view.nativeTranslationRows.add(candidate);
+        state.nativeTranslationRows ||= new Set();
+        state.nativeTranslationRows.add(candidate);
+        if (state.view) state.view.nativeTranslationRows = state.nativeTranslationRows;
         return;
       }
       if (candidate.matches?.(PRIMARY_SELECTOR) || candidate.querySelector?.(PRIMARY_SELECTOR)) return;
@@ -988,11 +995,12 @@
     return Boolean(button && path?.getAttribute("d") === SOURCE_ICON_PATH);
   }
 
-  function restoreNativeTranslationRows(view) {
-    for (const row of view?.nativeTranslationRows || []) {
+  function restoreNativeTranslationRows(state) {
+    const rows = state?.nativeTranslationRows || state?.view?.nativeTranslationRows || [];
+    for (const row of rows) {
       row.removeAttribute?.(NATIVE_TRANSLATION_HIDDEN_ATTR);
     }
-    view?.nativeTranslationRows?.clear?.();
+    rows.clear?.();
   }
 
   function displayLanguage(code) {
@@ -1014,8 +1022,9 @@
 
   function removeStateView(state) {
     const view = state.view;
-    if (!view || view.owner !== state) return;
-    restoreNativeTranslationRows(view);
+    if (view && view.owner !== state) return;
+    restoreNativeTranslationRows(state);
+    if (!view) return;
     clearExpansionPending(view);
     view.metaElement?.remove();
     view.translatedElement?.remove();
