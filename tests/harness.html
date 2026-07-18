@@ -12,22 +12,24 @@
       [data-testid="tweetText"] { white-space: pre-wrap; font-size: 17px; line-height: 22px; }
       a { color: #1d9bf0; text-decoration: none; }
       .emoji { width: 1em; height: 1em; vertical-align: -0.15em; }
+      [data-xtr-owned] > svg {
+        width: 1.25em;
+        height: 1.25em;
+        margin-right: 4px;
+        fill: currentColor;
+        vertical-align: -0.25em;
+      }
+      [data-xtr-owned="status"],
+      [data-xtr-owned="meta"] {
+        min-height: 16px;
+        padding-top: 4px;
+      }
       .quote { margin: 12px 0 0 35px; border: 1px solid #536471; border-radius: 12px; padding: 12px; }
       .harness-controls { display: flex; gap: 8px; margin-bottom: 16px; }
     </style>
     <script>
       const changeListeners = [];
       globalThis.xtrHarnessEvents = [];
-      globalThis.fetch = async (url) => {
-        xtrHarnessEvents.push({ type: "prefetch", at: Date.now(), url: String(url) });
-        return {
-          ok: true,
-          status: 200,
-          async text() {
-            return '<article><a href="/longpost/status/123456">post</a><div dir="auto">This expandable post starts right here. This continuation appears after expansion.</div></article>';
-          },
-        };
-      };
       globalThis.chrome = {
         runtime: {
           lastError: null,
@@ -43,7 +45,8 @@
               ["This comment loaded after the main post.", "Этот комментарий загрузился после основного поста."],
               ["Public post uses semantic markup.", "Публичный пост использует семантическую разметку."],
               ["This expandable post starts right here.", "Этот раскрываемый пост начинается прямо здесь."],
-              ["This expandable post starts right here. This continuation appears after expansion.", "Этот раскрываемый пост начинается прямо здесь. Продолжение появилось после раскрытия."],
+              ["This expandable post starts right here. This continuation appears after expansion and adds enough extra words to occupy several more lines in the translated post.", "Этот раскрываемый пост начинается прямо здесь. Продолжение появляется после раскрытия и добавляет достаточно дополнительных слов, чтобы занять ещё несколько строк в переведённом посте."],
+              ["This quoted post has a separate full continuation that belongs only to the quote.", "У этого цитируемого поста есть отдельное полное продолжение, принадлежащее только цитате."],
             ]);
             setTimeout(() => {
               xtrHarnessEvents.push({ type: "response", at: Date.now(), texts: message.items.map((item) => item.plainText) });
@@ -96,6 +99,10 @@
         <div data-testid="tweetText" lang="en">Hello <a href="/alice">@alice</a>!
 Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/news">#news</a> 🚀 <img class="emoji" alt="🔥" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Ctext y='16' font-size='16'%3E%F0%9F%94%A5%3C/text%3E%3C/svg%3E"></div>
       </article>
+      <article id="link-only-post" data-testid="tweet">
+        <div class="author">Link only <span style="color:#71767b">@link</span></div>
+        <div data-testid="tweetText" lang="en"><a href="https://security-guide-sf.openai.chatgpt-team.site"><span>…ity-guide-sf.openai.chatgpt-team.site</span><span style="display:none">https://security-guide-sf.openai.chatgpt-team.site</span></a></div>
+      </article>
       <article data-tweet-id="123" itemscope itemtype="https://schema.org/SocialMediaPosting">
         <meta itemprop="articleBody" content="Public post uses semantic markup.">
         <div class="author">Public <span style="color:#71767b">@public</span></div>
@@ -104,13 +111,49 @@ Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/new
       <article id="expandable-post" data-testid="tweet">
         <div class="author">Expandable <span style="color:#71767b">@longpost</span></div>
         <a href="/longpost/status/123456"><time>now</time></a>
-        <div data-testid="tweetText" lang="en">This expandable post starts right here.</div>
-        <a href="#" data-demo-show-more>Показать ещё</a>
+        <div class="post-body">
+          <div data-testid="tweetText" lang="en">This expandable post starts right here. <a href="#" data-demo-show-more>Показать ещё</a></div>
+        </div>
+        <div class="quote" role="link">
+          <div class="author">Quoted <span style="color:#71767b">@quoted</span></div>
+          <a href="/quoted/status/999"><time>now</time></a>
+          <div data-testid="tweetText" lang="en">This quoted post has a separate <a href="#" data-demo-show-more>Показать ещё</a></div>
+        </div>
       </article>
     </main>
     <script src="../shared.js"></script>
+    <script src="../tweet-data.js"></script>
     <script src="../content.js"></script>
     <script>
+      if (!new URLSearchParams(location.search).has("missing-record")) {
+        document.dispatchEvent(new CustomEvent(XTranslatorTweetData.EVENT_NAME, {
+          detail: JSON.stringify({
+          version: 1,
+          operation: "HomeTimeline",
+          records: [
+            {
+              id: "123456",
+              text: "This expandable post starts right here. This continuation appears after expansion and adds enough extra words to occupy several more lines in the translated post.",
+              lang: "en",
+              textSource: "note",
+              displayRange: null,
+              entities: [],
+              quotedId: "999",
+            },
+            {
+              id: "999",
+              text: "This quoted post has a separate full continuation that belongs only to the quote.",
+              lang: "en",
+              textSource: "note",
+              displayRange: null,
+              entities: [],
+              quotedId: "",
+            },
+          ],
+          }),
+        }));
+      }
+
       new MutationObserver((mutations) => {
         for (const mutation of mutations) {
           if (
@@ -173,15 +216,21 @@ Read <a href="https://example.com">https://example.com</a> <a href="/hashtag/new
         if (!control) return;
         xtrHarnessEvents.push({ type: "expand-click", at: Date.now() });
         event.preventDefault();
-        const article = control.closest("article");
-        const replacement = article.cloneNode(true);
+        const owner = control.closest(".post-body, .quote");
+        const replacement = owner.cloneNode(true);
         const original = replacement.querySelector('[data-testid="tweetText"]');
-        original.previousElementSibling?.remove();
-        original.nextElementSibling?.remove();
+        if (original.previousElementSibling?.matches?.("[data-xtr-owned]")) {
+          original.previousElementSibling.remove();
+        }
+        if (original.nextElementSibling?.matches?.("[data-xtr-owned]")) {
+          original.nextElementSibling.remove();
+        }
         original.removeAttribute("data-xtr-original-hidden");
-        original.textContent = "This expandable post starts right here. This continuation appears after expansion.";
+        original.textContent = owner.classList.contains("quote")
+          ? "This quoted post has a separate full continuation that belongs only to the quote."
+          : "This expandable post starts right here. This continuation appears after expansion and adds enough extra words to occupy several more lines in the translated post.";
         replacement.querySelector("[data-demo-show-more]")?.remove();
-        article.replaceWith(replacement);
+        owner.replaceWith(replacement);
       });
 
       setTimeout(() => {

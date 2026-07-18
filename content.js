@@ -4,9 +4,14 @@
   const {
     canReuseTranslationView,
     escapeHtml,
+    hasTranslatableText,
     languagesMatch,
     normalizePlainText,
   } = XTranslatorCore;
+  const {
+    EVENT_NAME: TWEET_DATA_EVENT,
+    sanitizeTweetDataEnvelope,
+  } = XTranslatorTweetData;
 
   const PRIMARY_SELECTOR = '[data-testid="tweetText"]';
   const PUBLIC_ARTICLE_SELECTOR = 'article[data-tweet-id][itemtype="https://schema.org/SocialMediaPosting"]';
@@ -23,6 +28,8 @@
   const RETRY_DELAY = 5_000;
   const MAX_RETRY_DELAY = 30_000;
   const EXPANSION_PREFETCH_LIMIT = 40;
+  const TWEET_RECORD_LIMIT = 1_000;
+  const TWEET_RECORD_WAIT = 5_000;
   const VIEWPORT_MARGIN_FACTOR = 0.75;
   const INITIAL_LOADING_DELAY = 350;
   const EARLY_GUARD_TIMEOUT = INITIAL_LOADING_DELAY + 100;
@@ -33,6 +40,12 @@
   const BLUR_TEXT_OFFSET = 10;
   const BLUR_TEXT_MAX_DURATION = 6_000;
   const BLUR_TEXT_EASING = "cubic-bezier(.22,.61,.36,1)";
+  const HEIGHT_TRANSITION_MIN_DURATION = 300;
+  const HEIGHT_TRANSITION_MAX_DURATION = 620;
+  const HEIGHT_TRANSITION_EASING = "cubic-bezier(.22,1,.36,1)";
+  const META_STATUS_EXIT_DURATION = 140;
+  const META_STATUS_ENTER_DURATION = 220;
+  const DEBUG = false;
 
   const states = new WeakMap();
   const trackedStates = new Set();
@@ -47,11 +60,72 @@
   const expansionControls = new WeakMap();
   const nativeExpansionControls = new WeakMap();
   const revealAnimations = new WeakMap();
+  const heightAnimations = new WeakMap();
+  const metaStatusTransitions = new WeakMap();
   const presentedTranslations = new Set();
   const releasedSources = new Set();
   const expandedPostTranslations = new Set();
+  const tweetRecords = new Map();
+  const tweetRecordWaiters = new Map();
 
+  document.addEventListener(TWEET_DATA_EVENT, handleTweetDataEvent);
   start();
+
+  function handleTweetDataEvent(event) {
+    if (typeof event.detail !== "string" || event.detail.length > 20_000_000) return;
+    try {
+      const envelope = sanitizeTweetDataEnvelope(JSON.parse(event.detail));
+      if (!envelope.records.length) return;
+      for (const record of envelope.records) storeTweetRecord(record);
+      debugLog("tweet data received", {
+        operation: envelope.operation,
+        ids: envelope.records.map((record) => record.id),
+      });
+      scheduleScan(0);
+    } catch (error) {
+      debugLog("tweet data rejected", error);
+    }
+  }
+
+  function storeTweetRecord(record) {
+    const current = tweetRecords.get(record.id);
+    const preferred = !current
+      || (record.textSource === "note" && current.textSource !== "note")
+      || record.text.length > current.text.length
+      ? record
+      : current;
+    tweetRecords.delete(record.id);
+    tweetRecords.set(record.id, preferred);
+    while (tweetRecords.size > TWEET_RECORD_LIMIT) {
+      tweetRecords.delete(tweetRecords.keys().next().value);
+    }
+    const waiters = tweetRecordWaiters.get(record.id);
+    if (!waiters) return;
+    tweetRecordWaiters.delete(record.id);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(preferred);
+    }
+  }
+
+  function waitForTweetRecord(id, timeout = TWEET_RECORD_WAIT) {
+    if (!id) return Promise.resolve(null);
+    const existing = tweetRecords.get(id);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve) => {
+      const waiters = tweetRecordWaiters.get(id) || new Set();
+      const waiter = {
+        resolve,
+        timer: setTimeout(() => {
+          waiters.delete(waiter);
+          if (!waiters.size) tweetRecordWaiters.delete(id);
+          resolve(null);
+        }, timeout),
+      };
+      waiters.add(waiter);
+      tweetRecordWaiters.set(id, waiters);
+    });
+  }
 
   async function start() {
     const settings = await storageGet({ enabled: true });
@@ -139,7 +213,7 @@
 
   function handleExpansionClick(event) {
     const control = event.target?.closest?.('button, a, [role="button"]');
-    if (!control || !isExpansionLabel(control.textContent)) return;
+    if (!control) return;
 
     const translatedView = expansionControls.get(control);
     if (translatedView) {
@@ -149,11 +223,10 @@
       return;
     }
 
-    const article = control.closest('article[data-testid="tweet"]') || control.closest("article");
-    const source = article?.querySelector(PRIMARY_SELECTOR);
-    const state = nativeExpansionControls.get(control) || (source ? states.get(source) : null);
+    const state = nativeExpansionControls.get(control) || null;
+    if (!state && !isExpansionLabel(control.textContent)) return;
     if (state) rememberTranslationExpanded(state);
-    const prepared = state?.postKey ? expansionPrefetches.get(state.postKey) : null;
+    const prepared = state?.targetKey ? expansionPrefetches.get(state.targetKey) : null;
     if (state?.view && prepared?.status !== "ready") showExpansionPending(state.view);
 
     setTimeout(() => {
@@ -255,6 +328,12 @@
       releaseSource(element);
       return;
     }
+    if (!request.hasTranslatableText) {
+      const existing = states.get(element);
+      if (existing) cleanupState(existing);
+      releaseSource(element);
+      return;
+    }
 
     // Do not inherit <html lang>: on public X pages it describes the interface,
     // not the post. When the text container has no own language, let Bing
@@ -289,7 +368,7 @@
     }
 
     const location = locateTarget(element);
-    const expansionControl = findPostExpansionControl(element, location.containerElement);
+    const expansionControl = findPostExpansionControl(element, location.targetContainer);
     const isExpandable = Boolean(expansionControl) || isExpandableText(request.plainText);
     const reusableState = previous
       || findAdjacentViewState(element)
@@ -299,6 +378,13 @@
       ? reusableState.pendingElement
       : null;
     const reusableLoadingDeadline = reusableState?.loadingDeadline || 0;
+    const reusableWasError = reusableState?.status === "error";
+    const reusableErrorKind = reusableState?.errorKind || "";
+    const reusableManualRetryRequested = reusableState?.manualRetryRequested === true;
+    const reusableSourceWasReleased = Boolean(
+      reusableState?.element?.hasAttribute?.(SOURCE_READY_ATTR)
+      || reusableWasError,
+    );
     const canReuseCompletedTranslation = Boolean(
       reusableState?.status === "translated"
       && reusableState.fingerprint === fingerprint
@@ -333,13 +419,19 @@
       requestId: String(++requestSequence),
       retryAt: 0,
       retryCount: Math.max(previous?.retryCount || 0, reusableState?.retryCount || 0),
+      manualRetryRequested: false,
+      forceRevealOnApply: reusableWasError && reusableManualRetryRequested,
       loadingTimer: null,
       loadingDeadline: reusableLoadingDeadline,
       pendingElement: reusablePendingElement,
       view: reusableView,
       containerElement: location.containerElement,
+      targetContainer: location.targetContainer,
       targetIndex: location.targetIndex,
       postKey: location.postKey,
+      targetKey: location.targetKey,
+      resourceId: location.resourceId,
+      targetRole: location.targetRole,
       isExpandable,
       sourceExpansionControl: expansionControl,
       collapsedMetrics: isExpandable
@@ -351,7 +443,11 @@
       expandTranslationOnApply: isExpansionReplacement,
       nativeTranslationRows,
     };
-    if (releasedSources.has(translationContentKey(state))) {
+    if (
+      reusableSourceWasReleased
+      || element.hasAttribute(SOURCE_READY_ATTR)
+      || releasedSources.has(translationContentKey(state))
+    ) {
       releaseSource(element);
     } else {
       holdSource(element);
@@ -369,8 +465,9 @@
       reusableView.sourceElement = element;
       reusableView.sourceExpansionControl = expansionControl;
       reusableView.nativeTranslationRows = nativeTranslationRows;
-      if (element.previousElementSibling !== reusableView.metaElement) {
-        element.before(reusableView.metaElement);
+      const metaMount = reusableView.metaSlotElement || reusableView.metaElement;
+      if (element.previousElementSibling !== metaMount) {
+        element.before(metaMount);
       }
       if (element.nextElementSibling !== reusableView.translatedElement) {
         element.after(reusableView.translatedElement);
@@ -385,6 +482,18 @@
     trackedStates.add(state);
     syncNativeTranslationRow(state);
 
+    // A failed full-text request stays manual even if X replaces the collapsed
+    // source after “Show more”. Keep the retry row attached to the active DOM
+    // version and wait until the user explicitly retries.
+    if (reusableWasError && !reusableManualRetryRequested) {
+      state.status = "error";
+      state.errorKind = reusableErrorKind;
+      state.retryAt = Number.POSITIVE_INFINITY;
+      if (!state.pendingElement) showTranslationError(state);
+      return;
+    }
+    if (reusableWasError && state.pendingElement) showRetryProgress(state);
+
     if (canReuseCompletedTranslation) {
       state.status = "translated";
       ensureViewMounted(state);
@@ -393,6 +502,7 @@
 
     const prefetched = matchingExpansionPrefetch(state);
     if (prefetched?.status === "ready") {
+      state.resourceId = prefetched.resourceId || state.resourceId;
       applyTranslation(state, prefetched.result, prefetched.request, {
         collapsible: state.isExpandable && !state.expandTranslationOnApply,
         expanded: isTranslationExpanded(state),
@@ -401,7 +511,7 @@
     }
 
     if (state.isExpandable) {
-      if (state.postKey) {
+      if (state.resourceId || statusIdFromPath(state.postKey)) {
         const entry = ensureExpansionPrefetch(state);
         waitForExpansionPrefetch(state, entry);
       } else {
@@ -411,7 +521,7 @@
     }
 
     if (isExpansionReplacement) {
-      const pending = expansionPrefetches.get(state.postKey);
+      const pending = expansionPrefetches.get(state.targetKey);
       if (pending && ["fetching", "queued", "loading"].includes(pending.status)) {
         showExpansionPending(state.view);
         waitForExpansionPrefetch(state, pending);
@@ -443,7 +553,7 @@
     }).catch((error) => {
       state.translationPromise = null;
       if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
-      console.debug("[X Translator] Перевод временно недоступен:", error);
+      debugLog("translation unavailable", error);
       markForRetry(state, error?.retryAfterMs, error?.xtrKind || "translation");
     });
   }
@@ -454,7 +564,8 @@
     if (!meta || !translation) return null;
 
     for (const state of trackedStates) {
-      if (state.view?.metaElement === meta && state.view?.translatedElement === translation) {
+      const viewMeta = state.view?.metaSlotElement || state.view?.metaElement;
+      if (viewMeta === meta && state.view?.translatedElement === translation) {
         return state;
       }
     }
@@ -466,32 +577,81 @@
       || element.closest("article")
       || element.parentElement;
     if (!containerElement) {
-      return { containerElement: null, targetIndex: -1, postKey: "" };
+      return {
+        containerElement: null,
+        targetContainer: null,
+        targetIndex: -1,
+        postKey: "",
+        targetKey: "",
+        resourceId: "",
+        targetRole: "unknown",
+      };
     }
     const targets = [...containerElement.querySelectorAll(PRIMARY_SELECTOR)];
-    const time = containerElement.querySelector('a[href*="/status/"] time');
-    const statusLink = time?.closest?.("a")
-      || containerElement.querySelector('a[href*="/status/"]');
-    return {
+    const targetIndex = targets.indexOf(element);
+    const targetContainer = findTargetContainer(element, containerElement);
+    const statusLink = findStatusLink(containerElement);
+    const postKey = statusLink?.getAttribute?.("href") || "";
+    const outerId = statusIdFromPath(postKey);
+    const targetRole = targetIndex > 0 ? "quote" : "main";
+    const scopedId = statusIdFromPath(findStatusLink(targetContainer)?.getAttribute?.("href"));
+    const resourceId = targetRole === "main"
+      ? outerId
+      : scopedId && scopedId !== outerId
+        ? scopedId
+        : tweetRecords.get(outerId)?.quotedId || "";
+    const identity = outerId || normalizeStatusPath(postKey);
+    const result = {
       containerElement,
-      targetIndex: targets.indexOf(element),
-      postKey: statusLink?.getAttribute?.("href") || "",
+      targetContainer,
+      targetIndex,
+      postKey,
+      targetKey: identity ? `${identity}:${targetRole}:${targetIndex}` : "",
+      resourceId,
+      targetRole,
     };
+    debugLog("target located", {
+      postKey: result.postKey,
+      targetIndex: result.targetIndex,
+      targetKey: result.targetKey,
+      resourceId: result.resourceId,
+      targetRole: result.targetRole,
+    });
+    return result;
+  }
+
+  function findTargetContainer(element, outerContainer) {
+    let scope = element;
+    for (let parent = element.parentElement; parent && parent !== outerContainer; parent = parent.parentElement) {
+      if (parent.querySelectorAll(PRIMARY_SELECTOR).length !== 1) break;
+      scope = parent;
+    }
+    return scope;
+  }
+
+  function findStatusLink(root) {
+    if (!root) return null;
+    const timed = root.querySelector?.('a[href*="/status/"] time')?.closest?.("a");
+    return timed || root.querySelector?.('a[href*="/status/"]') || null;
+  }
+
+  function statusIdFromPath(value) {
+    return normalizeStatusPath(value).match(/\/status\/(\d+)/u)?.[1] || "";
   }
 
   function findContainerState(location, plainText) {
-    if (!location.containerElement && !location.postKey) return null;
+    if (!location.containerElement && !location.targetKey) return null;
     let best = null;
     for (const state of trackedStates) {
       if (["removed", "superseded", "skipped"].includes(state.status)) continue;
       const sameContainer = state.containerElement === location.containerElement;
-      const samePost = location.postKey && state.postKey === location.postKey;
+      const samePost = location.targetKey && state.targetKey === location.targetKey;
       if (!canReuseTranslationView({
         sameContainer,
         samePost,
         sourceConnected: state.element.isConnected,
       })) continue;
-      if (state.targetIndex !== location.targetIndex) continue;
+      if (state.targetKey !== location.targetKey) continue;
       if (!textsRepresentSamePost(state.plainText, plainText)) continue;
       if (!best || Number(state.requestId) > Number(best.requestId)) best = state;
     }
@@ -526,9 +686,8 @@
   }
 
   function matchingExpansionPrefetch(state) {
-    if (!state.postKey) return null;
-    const entry = expansionPrefetches.get(state.postKey);
-    return entry?.request?.plainText === state.plainText ? entry : null;
+    if (!state.targetKey) return null;
+    return expansionPrefetches.get(state.targetKey) || null;
   }
 
   function waitForExpansionPrefetch(state, entry) {
@@ -539,6 +698,7 @@
     entry.promise.then((resolved) => {
       if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
       if (resolved.status === "ready" && resolved.request && resolved.result) {
+        state.resourceId = resolved.resourceId || state.resourceId;
         applyTranslation(state, resolved.result, resolved.request, {
           collapsible: state.isExpandable && !state.expandTranslationOnApply,
           expanded: isTranslationExpanded(state),
@@ -554,13 +714,17 @@
   }
 
   function ensureExpansionPrefetch(state) {
-    const existing = expansionPrefetches.get(state.postKey);
+    const existing = expansionPrefetches.get(state.targetKey);
     if (existing && existing.status !== "error") return existing;
-    if (existing) expansionPrefetches.delete(state.postKey);
+    if (existing) expansionPrefetches.delete(state.targetKey);
 
     const entry = {
+      targetKey: state.targetKey,
       postKey: state.postKey,
-      truncatedBase: expansionBase(state.plainText),
+      targetRole: state.targetRole,
+      resourceId: state.resourceId,
+      parentResourceId: statusIdFromPath(state.postKey),
+      sourceElement: state.element,
       status: "fetching",
       priority: translationPriority(state),
       request: null,
@@ -569,7 +733,7 @@
       errorKind: "",
       promise: null,
     };
-    expansionPrefetches.set(entry.postKey, entry);
+    expansionPrefetches.set(entry.targetKey, entry);
     entry.promise = prepareExpansionPrefetch(entry);
     trimExpansionPrefetches();
     return entry;
@@ -578,7 +742,13 @@
   async function prepareExpansionPrefetch(entry) {
     try {
       try {
-        entry.request = await fetchFullPostRequest(entry.postKey, entry.truncatedBase);
+        const record = await resolveExpansionRecord(entry);
+        if (!record) throw new Error("X ещё не передал полный текст поста.");
+        entry.resourceId = record.id;
+        entry.request = buildTweetRecordRequest(record, entry.sourceElement);
+        if (!entry.request.plainText || !entry.request.hasTranslatableText) {
+          throw new Error("В полном тексте нет текста для перевода.");
+        }
       } catch (error) {
         error.xtrKind = "full-text";
         throw error;
@@ -586,7 +756,7 @@
 
       entry.status = "queued";
       entry.result = await requestTranslation({
-        id: `full:${normalizeStatusPath(entry.postKey)}`,
+        id: `full:${entry.resourceId}`,
         html: entry.request.html,
         plainText: entry.request.plainText,
       }, () => entry.priority, () => {
@@ -597,37 +767,22 @@
       entry.status = "error";
       entry.error = error;
       entry.errorKind = error?.xtrKind || "translation";
-      console.debug("[X Translator] Не удалось подготовить полный пост:", error);
+      debugLog("full post preparation failed", error);
     } finally {
       trimExpansionPrefetches();
     }
     return entry;
   }
 
-  async function fetchFullPostRequest(postKey, truncatedBase) {
-    const url = new URL(postKey, location.origin);
-    const response = await fetch(url.href, {
-      cache: "force-cache",
-      credentials: "omit",
-      headers: { Accept: "text/html" },
-    });
-    if (!response.ok) throw new Error(`X ответил ${response.status}.`);
-
-    const html = await response.text();
-    const fetchedDocument = new DOMParser().parseFromString(html, "text/html");
-    const expectedPath = normalizeStatusPath(postKey);
-    const article = [...fetchedDocument.querySelectorAll("article")].find((candidate) => (
-      [...candidate.querySelectorAll('a[href*="/status/"]')]
-        .some((link) => normalizeStatusPath(link.getAttribute("href")) === expectedPath)
-    ));
-    const root = article || fetchedDocument.body;
-    const candidates = [...root.querySelectorAll('[dir="auto"]')]
-      .map((element) => ({ element, text: normalizePlainText(element.textContent) }))
-      .filter(({ text }) => text.length > truncatedBase.length + 8)
-      .filter(({ text }) => expansionBase(text).startsWith(truncatedBase))
-      .sort((left, right) => right.text.length - left.text.length);
-    if (!candidates[0]) throw new Error("X не отдал полный текст поста.");
-    return buildRequest(candidates[0].element, true);
+  async function resolveExpansionRecord(entry) {
+    if (entry.resourceId) return waitForTweetRecord(entry.resourceId);
+    if (entry.targetRole !== "quote") {
+      return waitForTweetRecord(entry.parentResourceId);
+    }
+    const parent = await waitForTweetRecord(entry.parentResourceId);
+    if (!parent?.quotedId) return null;
+    entry.resourceId = parent.quotedId;
+    return waitForTweetRecord(parent.quotedId);
   }
 
   function normalizeStatusPath(value) {
@@ -636,6 +791,11 @@
     } catch {
       return "";
     }
+  }
+
+  function debugLog(event, details) {
+    if (!DEBUG) return;
+    console.debug(`[X Translator][debug] ${event}`, details);
   }
 
   function trimExpansionPrefetches() {
@@ -649,19 +809,121 @@
 
   function buildRequest(element, preferTextContent = false) {
     const tokens = [];
-    const html = [...element.childNodes].map((node) => serializeNode(node, tokens)).join("");
+    const translatableText = [];
+    const html = [...element.childNodes]
+      .map((node) => serializeNode(node, tokens, translatableText))
+      .join("");
     return {
       plainText: normalizePlainText(
         preferTextContent ? element.textContent : element.innerText || element.textContent,
       ),
       html: `<div>${html}</div>`,
       tokens,
+      hasTranslatableText: hasTranslatableText(translatableText.join(" ")),
     };
   }
 
-  function serializeNode(node, tokens) {
+  function buildTweetRecordRequest(record, sourceElement) {
+    const root = document.createElement("div");
+    const fullText = String(record.text || "");
+    const [displayStart, displayEnd] = record.textSource === "note" || !record.displayRange
+      ? [0, fullText.length]
+      : normalizeDisplayRange(fullText, record.displayRange);
+    const text = fullText.slice(displayStart, displayEnd);
+    const ranges = [];
+    let searchCursor = displayStart;
+
+    for (const entity of record.entities || []) {
+      const range = resolveEntityRange(fullText, entity, searchCursor);
+      if (!range || range[0] < displayStart || range[1] > displayEnd) continue;
+      if (ranges.some((item) => range[0] < item.end && range[1] > item.start)) continue;
+      ranges.push({ start: range[0], end: range[1], entity });
+      searchCursor = range[1];
+    }
+    ranges.sort((left, right) => left.start - right.start || left.end - right.end);
+
+    let cursor = 0;
+    for (const item of ranges) {
+      const start = item.start - displayStart;
+      const end = item.end - displayStart;
+      if (start > cursor) root.append(document.createTextNode(text.slice(cursor, start)));
+      if (item.entity.type !== "media") {
+        root.append(createRecordEntityElement(item.entity, sourceElement));
+      }
+      cursor = end;
+    }
+    if (cursor < text.length) root.append(document.createTextNode(text.slice(cursor)));
+    return buildRequest(root, true);
+  }
+
+  function normalizeDisplayRange(text, range) {
+    const direct = [
+      Math.max(0, Math.min(text.length, Number(range[0]) || 0)),
+      Math.max(0, Math.min(text.length, Number(range[1]) || text.length)),
+    ];
+    if (direct[1] > direct[0]) return direct;
+    return [0, text.length];
+  }
+
+  function codePointOffset(text, index) {
+    return Array.from(text).slice(0, Math.max(0, index)).join("").length;
+  }
+
+  function resolveEntityRange(text, entity, cursor = 0) {
+    const raw = String(entity.raw || "");
+    if (!raw) return null;
+    const [start, end] = entity.indices || [];
+    const candidates = [
+      [start, end],
+      [codePointOffset(text, start), codePointOffset(text, end)],
+    ];
+    for (const candidate of candidates) {
+      if (
+        Number.isInteger(candidate[0])
+        && Number.isInteger(candidate[1])
+        && text.slice(candidate[0], candidate[1]) === raw
+      ) return candidate;
+    }
+    let located = text.indexOf(raw, Math.max(0, cursor));
+    if (located < 0) located = text.indexOf(raw);
+    return located >= 0 ? [located, located + raw.length] : null;
+  }
+
+  function createRecordEntityElement(entity, sourceElement) {
+    const display = entity.display || entity.raw;
+    const href = safeRecordHref(entity.href);
+    const matching = [...(sourceElement?.querySelectorAll?.("a") || [])]
+      .find((anchor) => {
+        const text = normalizePlainText(anchor.textContent);
+        return text === normalizePlainText(display) || text === normalizePlainText(entity.raw);
+      });
+    const anchor = matching?.cloneNode(true) || document.createElement("a");
+    stripConflictingAttributes(anchor, true);
+    anchor.textContent = display;
+    if (href) anchor.setAttribute("href", href);
+    else anchor.removeAttribute("href");
+    if (!matching) {
+      anchor.dir = "ltr";
+      anchor.setAttribute("role", "link");
+      anchor.style.color = "rgb(29, 155, 240)";
+      anchor.style.textDecoration = "none";
+    }
+    return anchor;
+  }
+
+  function safeRecordHref(value) {
+    if (typeof value !== "string" || !/^https:\/\//iu.test(value)) return "";
+    try {
+      const url = new URL(value);
+      return url.protocol === "https:" && !url.username && !url.password ? value : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function serializeNode(node, tokens, translatableText) {
     if (node.nodeType === Node.TEXT_NODE) {
-      return serializeText(node.nodeValue || "", tokens);
+      return serializeText(node.nodeValue || "", tokens, translatableText);
     }
     if (node.nodeType !== Node.ELEMENT_NODE) return "";
 
@@ -672,16 +934,19 @@
       return serializeProtectedElement(node, tokens);
     }
 
-    return [...node.childNodes].map((child) => serializeNode(child, tokens)).join("");
+    return [...node.childNodes]
+      .map((child) => serializeNode(child, tokens, translatableText))
+      .join("");
   }
 
-  function serializeText(value, tokens) {
+  function serializeText(value, tokens, translatableText) {
     const parts = String(value).split(/((?:https?:\/\/|www\.)\S+|@[\p{L}\p{N}_]+|#[\p{L}\p{N}_]+|\$[A-Z][A-Z0-9_]*)/gu);
     return parts.map((part) => {
       if (!part) return "";
       if (/^(?:https?:\/\/|www\.|@|#|\$[A-Z])/u.test(part)) {
         return serializeProtectedText(part, tokens);
       }
+      translatableText.push(part);
       return escapeHtml(part).replace(/\r\n?|\n/g, "<br/>");
     }).join("");
   }
@@ -771,16 +1036,16 @@
     const delay = Math.max(backoff, Number(retryAfterMs || 0));
     state.status = "error";
     state.errorKind = errorKind;
-    state.retryAt = Date.now() + delay;
+    state.manualRetryRequested = false;
+    state.retryAt = errorKind === "full-text"
+      ? Number.POSITIVE_INFINITY
+      : Date.now() + delay;
     if (!state.view) restoreNativeTranslationRows(state);
     showTranslationError(state);
+    if (errorKind === "full-text") return;
     setTimeout(() => {
       if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
-      resetFailedExpansion(state);
-      if (state.view) {
-        clearExpansionPending(state.view);
-        showExpansionPending(state.view);
-      }
+      showRetryProgress(state);
       processTarget(state.element);
     }, delay + 25);
   }
@@ -791,8 +1056,22 @@
       return;
     }
     if (states.get(state.element) !== state) return;
-    clearStatePending(state);
+    const pendingSlot = state.pendingElement?.isConnected
+      ? state.pendingElement
+      : null;
+    const pendingHeight = pendingSlot
+      ? pendingSlot.getBoundingClientRect().height
+      : 0;
+    const sourceHeight = state.collapsedMetrics?.totalHeight
+      || state.element.getBoundingClientRect().height;
+    const previousTextHeight = state.view && !state.view.showingOriginal
+      ? state.view.translatedElement.getBoundingClientRect().height
+        + (state.view.expansionElement && !state.view.expansionElement.hidden
+          ? state.view.expansionElement.getBoundingClientRect().height
+          : 0)
+      : sourceHeight;
     if (languagesMatch(result.detectedLanguage, TARGET_LANGUAGE)) {
+      clearStatePending(state);
       clearExpansionPending(state.view);
       releaseSource(state.element);
       removeStateView(state);
@@ -804,6 +1083,7 @@
     const fragment = renderTranslation(result.translatedHtml, request.tokens || []);
     const renderedText = normalizePlainText(fragment.textContent);
     if (!renderedText || renderedText.toLocaleLowerCase("ru") === request.plainText.toLocaleLowerCase("ru")) {
+      clearStatePending(state);
       clearExpansionPending(state.view);
       releaseSource(state.element);
       removeStateView(state);
@@ -816,7 +1096,7 @@
     translated.setAttribute("data-xtr-owned", "translation");
     translated.setAttribute("lang", TARGET_LANGUAGE);
     translated.setAttribute("dir", "auto");
-    const collapsible = Boolean(options.collapsible && state.collapsedMetrics);
+    const collapsible = Boolean(options.collapsible && state.collapsedMetrics?.control);
     const initiallyExpanded = !collapsible || Boolean(options.expanded);
     const fullContent = collapsible ? document.createElement("span") : null;
     const expandControl = collapsible ? createTranslatedExpansionControl(state) : null;
@@ -828,10 +1108,13 @@
       translated.append(fragment);
     }
     const shouldReveal = shouldRevealTranslation(state, result);
+    const retainedMetaSlot = takeStatePending(state);
 
     if (state.view) {
+      retainedMetaSlot?.remove();
       const view = state.view;
       finishTranslationReveal(view.translatedElement);
+      finishHeightTransition(view.translatedElement);
       clearExpansionPending(view);
       if (view.languageLabel) {
         view.languageLabel.textContent = `Исходный язык: ${displayLanguage(result.detectedLanguage)}`;
@@ -853,6 +1136,9 @@
       if (!view.showingOriginal && shouldReveal) {
         revealTranslation(translated);
       }
+      if (!view.showingOriginal) {
+        transitionHeightFrom(translated, previousTextHeight);
+      }
       syncNativeTranslationRow(state);
       state.status = "translated";
       return;
@@ -862,6 +1148,7 @@
       owner: state,
       sourceElement: state.element,
       metaElement: null,
+      metaSlotElement: null,
       translatedElement: translated,
       showingOriginal: false,
       expansionElement: null,
@@ -877,12 +1164,17 @@
     if (expandControl) expansionControls.set(expandControl, view);
     const meta = createMetaRow(result.detectedLanguage, view);
     view.metaElement = meta;
+    const metaSlot = retainedMetaSlot || createMetaSlot(meta);
+    view.metaSlotElement = metaSlot;
     state.view = view;
-    state.element.before(meta);
+    if (!metaSlot.isConnected) state.element.before(metaSlot);
+    if (retainedMetaSlot) transitionMetaSlotContent(metaSlot, meta);
     state.element.after(translated);
     applyTranslationExpansion(view);
     setOriginalVisible(view, false);
     if (shouldReveal) revealTranslation(translated);
+    if (!retainedMetaSlot) transitionHeightFrom(metaSlot, pendingHeight);
+    transitionHeightFrom(translated, sourceHeight);
     syncNativeTranslationRow(state);
     state.status = "translated";
   }
@@ -899,9 +1191,6 @@
   function findPostExpansionControl(element, container) {
     const direct = findExpansionControl(element);
     if (direct) return direct;
-
-    const parentCandidates = expansionControlCandidates(element.parentElement);
-    if (parentCandidates.length) return nearestExpansionControl(element, parentCandidates);
     return nearestExpansionControl(element, expansionControlCandidates(container));
   }
 
@@ -941,14 +1230,22 @@
   }
 
   function findExpansionControl(element) {
+    const nativeButton = [...element.querySelectorAll('button, [role="button"]:not(a)')]
+      .find((candidate) => !candidate.closest(OWNED_SELECTOR));
+    if (nativeButton) return nativeButton;
+
     return [...element.querySelectorAll('button, a, [role="button"]')]
-      .find((candidate) => isExpansionLabel(candidate.textContent)) || null;
+      .find((candidate) => (
+        !candidate.closest(OWNED_SELECTOR)
+        && isExpansionLabel(candidate.textContent)
+      )) || null;
   }
 
   function createTranslatedExpansionControl(state) {
     const control = state.collapsedMetrics?.control?.cloneNode(true)
       || document.createElement("button");
     stripConflictingAttributes(control, true);
+    control.hidden = false;
     control.setAttribute(EXPAND_CONTROL_ATTR, "");
     control.setAttribute("data-xtr-owned", "expand-control");
     control.setAttribute("role", "button");
@@ -984,8 +1281,7 @@
   }
 
   function translationExpansionKey(state) {
-    const postPath = normalizeStatusPath(state?.postKey);
-    return postPath ? `${postPath}\u0000${state?.targetIndex ?? -1}` : "";
+    return state?.resourceId || state?.targetKey || "";
   }
 
   function isTranslationExpanded(state) {
@@ -1016,8 +1312,168 @@
     view.expanded = true;
     revealTranslation(view.translatedElement, {
       tokens: continuation,
-      beforeAnimate: () => applyTranslationExpansion(view),
+      beforeAnimate: () => animateHeightChange(
+        view.translatedElement,
+        () => applyTranslationExpansion(view),
+      ),
     });
+  }
+
+  function animateHeightChange(element, mutate) {
+    if (!element) {
+      mutate?.();
+      return;
+    }
+    const startHeight = element.getBoundingClientRect().height;
+    finishHeightTransition(element);
+    mutate?.();
+    transitionHeightFrom(element, startHeight);
+  }
+
+  function transitionHeightFrom(element, startHeight) {
+    if (!element?.isConnected) return;
+    finishHeightTransition(element);
+
+    const endHeight = element.getBoundingClientRect().height;
+    const delta = Math.abs(endHeight - startHeight);
+    if (
+      !Number.isFinite(startHeight)
+      || !Number.isFinite(endHeight)
+      || delta < 1
+      || element.hidden
+      || !isHeightTransitionVisible(element)
+      || window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+    ) return;
+
+    const finalHeight = element.style.getPropertyValue("height");
+    const finalHeightPriority = element.style.getPropertyPriority("height");
+    const duration = Math.min(
+      HEIGHT_TRANSITION_MAX_DURATION,
+      HEIGHT_TRANSITION_MIN_DURATION + (delta * 0.55),
+    );
+
+    element.setAttribute("data-xtr-height-transition", "");
+    element.style.height = `${Math.max(0, startHeight)}px`;
+    const animation = element.animate(
+      [
+        { height: `${Math.max(0, startHeight)}px` },
+        { height: `${Math.max(0, endHeight)}px` },
+      ],
+      {
+        duration,
+        easing: HEIGHT_TRANSITION_EASING,
+        fill: "forwards",
+      },
+    );
+    const active = {
+      animation,
+      finalHeight,
+      finalHeightPriority,
+      settleFrame: null,
+    };
+    heightAnimations.set(element, active);
+
+    animation.finished.catch(() => undefined).then(() => {
+      if (heightAnimations.get(element) !== active) return;
+      active.settleFrame = requestAnimationFrame(() => completeHeightTransition(element));
+    });
+  }
+
+  function isHeightTransitionVisible(element) {
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || 800;
+    return rect.bottom >= -32 && rect.top <= viewportHeight + 32;
+  }
+
+  function completeHeightTransition(element) {
+    const active = heightAnimations.get(element);
+    if (!active) return;
+    if (active.settleFrame !== null) cancelAnimationFrame(active.settleFrame);
+    active.animation.cancel();
+    restoreInlineProperty(
+      element,
+      "height",
+      active.finalHeight,
+      active.finalHeightPriority,
+    );
+    element.removeAttribute("data-xtr-height-transition");
+    heightAnimations.delete(element);
+  }
+
+  function finishHeightTransition(element) {
+    if (!element) return;
+    const active = heightAnimations.get(element);
+    if (active) completeHeightTransition(element);
+    element.removeAttribute("data-xtr-height-transition");
+  }
+
+  function transitionMetaSlotContent(slot, nextElement) {
+    if (!slot || !nextElement) return;
+    finishMetaStatusTransition(slot);
+    const previousElement = slot.firstElementChild;
+    if (!previousElement || previousElement === nextElement) {
+      slot.replaceChildren(nextElement);
+      return;
+    }
+    if (
+      !slot.isConnected
+      || window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+    ) {
+      slot.replaceChildren(nextElement);
+      return;
+    }
+
+    const exitAnimation = previousElement.animate(
+      [
+        { opacity: 1, transform: "translateY(0)" },
+        { opacity: 0, transform: "translateY(-2px)" },
+      ],
+      {
+        duration: META_STATUS_EXIT_DURATION,
+        easing: "ease-out",
+        fill: "forwards",
+      },
+    );
+    const active = {
+      animations: [exitAnimation],
+      nextElement,
+    };
+    metaStatusTransitions.set(slot, active);
+
+    exitAnimation.finished.catch(() => undefined).then(() => {
+      if (metaStatusTransitions.get(slot) !== active) return;
+      const startHeight = slot.getBoundingClientRect().height;
+      exitAnimation.cancel();
+      slot.replaceChildren(nextElement);
+      transitionHeightFrom(slot, startHeight);
+
+      const enterAnimation = nextElement.animate(
+        [
+          { opacity: 0, transform: "translateY(2px)" },
+          { opacity: 1, transform: "translateY(0)" },
+        ],
+        {
+          duration: META_STATUS_ENTER_DURATION,
+          easing: HEIGHT_TRANSITION_EASING,
+          fill: "forwards",
+        },
+      );
+      active.animations = [enterAnimation];
+      return enterAnimation.finished.catch(() => undefined).then(() => {
+        if (metaStatusTransitions.get(slot) !== active) return;
+        enterAnimation.cancel();
+        metaStatusTransitions.delete(slot);
+      });
+    });
+  }
+
+  function finishMetaStatusTransition(slot) {
+    if (!slot) return;
+    const active = metaStatusTransitions.get(slot);
+    if (!active) return;
+    active.animations.forEach((animation) => animation.cancel());
+    if (active.nextElement) slot.replaceChildren(active.nextElement);
+    metaStatusTransitions.delete(slot);
   }
 
   function revealTranslation(element, options = {}) {
@@ -1164,6 +1620,8 @@
   function shouldRevealTranslation(state, result) {
     const keys = translationPresentationKeys(state);
     const alreadyPresented = keys.some((key) => presentedTranslations.has(key));
+    const forceReveal = state?.forceRevealOnApply === true;
+    if (state) state.forceRevealOnApply = false;
     for (const key of keys) {
       presentedTranslations.add(key);
       releasedSources.delete(key);
@@ -1171,22 +1629,21 @@
     while (presentedTranslations.size > 1_000) {
       presentedTranslations.delete(presentedTranslations.values().next().value);
     }
-    return result.cached !== true && !alreadyPresented;
+    return forceReveal || (result.cached !== true && !alreadyPresented);
   }
 
   function translationPresentationKeys(state) {
     const contentKey = translationContentKey(state);
     if (!contentKey) return [];
-    const postPath = normalizeStatusPath(state?.postKey);
-    return postPath
-      ? [contentKey, `${postPath}\u0000${contentKey}`]
-      : [contentKey];
+    const resourceKey = state?.resourceId || state?.targetKey || "";
+    return resourceKey ? [contentKey, `${resourceKey}\u0000${contentKey}`] : [contentKey];
   }
 
   function translationContentKey(state) {
     const text = normalizePlainText(state?.translationPlainText || state?.plainText);
     if (!text) return "";
-    return `${state?.targetIndex ?? -1}\u0000${text}`;
+    const identity = state?.resourceId || state?.targetKey || String(state?.targetIndex ?? -1);
+    return `${identity}\u0000${text}`;
   }
 
   function rememberSourceReleased(state) {
@@ -1239,9 +1696,11 @@
       node.removeAttribute("id");
       node.removeAttribute("data-testid");
       node.removeAttribute("aria-describedby");
-      node.removeAttribute("data-xtr-original-hidden");
-      node.removeAttribute(SOURCE_READY_ATTR);
-      node.removeAttribute(NATIVE_TRANSLATION_HIDDEN_ATTR);
+      [...node.attributes].forEach((attribute) => {
+        if (attribute.name.startsWith("data-xtr-")) {
+          node.removeAttribute(attribute.name);
+        }
+      });
     });
   }
 
@@ -1287,7 +1746,7 @@
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      setOriginalVisible(view, !view.showingOriginal);
+      setOriginalVisible(view, !view.showingOriginal, { animate: true });
     });
 
     view.languageLabel = languageLabel;
@@ -1340,8 +1799,18 @@
     const text = row.querySelector('[data-xtr-status-text]');
     text.textContent = "Перевожу…";
     text.classList.add("xtr-shimmer");
-    state.element.before(row);
-    state.pendingElement = row;
+    const slot = createMetaSlot(row);
+    state.element.before(slot);
+    state.pendingElement = slot;
+    transitionHeightFrom(slot, 0);
+  }
+
+  function createMetaSlot(content) {
+    const slot = document.createElement("div");
+    slot.setAttribute("data-xtr-owned", "meta-slot");
+    slot.setAttribute("data-xtr-meta-slot", "");
+    if (content) slot.append(content);
+    return slot;
   }
 
   function createMetaStatusRow() {
@@ -1373,19 +1842,21 @@
     indicator.hidden = view.showingOriginal;
     view.translatedElement.after(indicator);
     view.expansionElement = indicator;
+    if (!indicator.hidden) transitionHeightFrom(indicator, 0);
   }
 
   function clearExpansionPending(view) {
+    finishHeightTransition(view?.expansionElement);
     view?.expansionElement?.remove();
     if (view) view.expansionElement = null;
   }
 
   function showTranslationError(state) {
-    clearStatePending(state);
     rememberSourceReleased(state);
     releaseSource(state.element);
 
     if (state.view) {
+      clearStatePending(state);
       clearExpansionPending(state.view);
       const indicator = document.createElement("div");
       indicator.dir = "ltr";
@@ -1396,6 +1867,7 @@
       indicator.hidden = state.view.showingOriginal;
       state.view.translatedElement.after(indicator);
       state.view.expansionElement = indicator;
+      if (!indicator.hidden) transitionHeightFrom(indicator, 0);
       return;
     }
 
@@ -1404,8 +1876,11 @@
     const label = text.parentElement;
     text.remove();
     appendRetryContent(label, state);
-    state.element.before(row);
-    state.pendingElement = row;
+    const slot = takeStatePending(state) || createMetaSlot(row);
+    if (!slot.isConnected) state.element.before(slot);
+    if (slot.firstElementChild !== row) transitionMetaSlotContent(slot, row);
+    state.pendingElement = slot;
+    if (slot.firstElementChild === row) transitionHeightFrom(slot, 0);
   }
 
   function appendRetryContent(container, state) {
@@ -1420,39 +1895,94 @@
     retry.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!enabled || !state.element.isConnected || states.get(state.element) !== state) return;
-      state.retryAt = 0;
-      state.status = "error";
-      resetFailedExpansion(state);
-      if (state.view) {
-        clearExpansionPending(state.view);
-        showExpansionPending(state.view);
+      const activeState = resolveActiveRetryState(state);
+      if (!enabled || !activeState) return;
+      if (["queued", "loading"].includes(activeState.status)) {
+        showRetryProgress(activeState);
+        return;
       }
-      processTarget(state.element);
+      if (["translated", "skipped"].includes(activeState.status)) return;
+      activeState.retryAt = 0;
+      activeState.manualRetryRequested = true;
+      activeState.status = "error";
+      showRetryProgress(activeState);
+      processTarget(activeState.element);
     });
     container.append(retry);
   }
 
-  function resetFailedExpansion(state) {
-    if (!state?.postKey) return;
-    const entry = expansionPrefetches.get(state.postKey);
-    if (entry?.status === "error") expansionPrefetches.delete(state.postKey);
+  function resolveActiveRetryState(state) {
+    if (state?.element?.isConnected && states.get(state.element) === state) return state;
+
+    let latest = null;
+    for (const candidate of trackedStates) {
+      if (!candidate.element?.isConnected) continue;
+      if (state?.targetKey && candidate.targetKey !== state.targetKey) continue;
+      if (!state?.targetKey && candidate.containerElement !== state?.containerElement) continue;
+      if (!latest || Number(candidate.requestId) > Number(latest.requestId)) latest = candidate;
+    }
+    return latest;
   }
 
-  function clearStatePending(state) {
+  function resetFailedExpansion(state) {
+    if (!state?.targetKey) return;
+    const entry = expansionPrefetches.get(state.targetKey);
+    if (entry?.status === "error") expansionPrefetches.delete(state.targetKey);
+  }
+
+  function showRetryProgress(state) {
+    resetFailedExpansion(state);
+    if (state.view) {
+      clearExpansionPending(state.view);
+      showExpansionPending(state.view);
+      return;
+    }
+
+    const row = createMetaStatusRow();
+    const text = row.querySelector('[data-xtr-status-text]');
+    text.textContent = "Перевожу…";
+    text.classList.add("xtr-shimmer");
+    const slot = state.pendingElement?.isConnected
+      ? state.pendingElement
+      : createMetaSlot(row);
+    if (!slot.isConnected) state.element.before(slot);
+    if (slot.firstElementChild !== row) transitionMetaSlotContent(slot, row);
+    state.pendingElement = slot;
+  }
+
+  function takeStatePending(state) {
     if (!state) return;
     if (state.loadingTimer !== null) {
       clearTimeout(state.loadingTimer);
       state.loadingTimer = null;
     }
     state.loadingDeadline = 0;
-    state.pendingElement?.remove();
+    const pending = state.pendingElement;
     state.pendingElement = null;
+    return pending;
   }
 
-  function setOriginalVisible(view, visible) {
+  function clearStatePending(state) {
+    const pending = takeStatePending(state);
+    finishMetaStatusTransition(pending);
+    finishHeightTransition(pending);
+    pending?.remove();
+  }
+
+  function setOriginalVisible(view, visible, options = {}) {
     if (!view?.sourceElement || !view.metaElement || !view.translatedElement) return;
-    view.showingOriginal = Boolean(visible);
+    const nextShowingOriginal = Boolean(visible);
+    const visibilityChanges = view.showingOriginal !== nextShowingOriginal;
+    const currentElement = view.showingOriginal ? view.sourceElement : view.translatedElement;
+    const nextElement = nextShowingOriginal ? view.sourceElement : view.translatedElement;
+    const startHeight = visibilityChanges
+      ? currentElement.getBoundingClientRect().height
+      : 0;
+    if (visibilityChanges) {
+      finishHeightTransition(currentElement);
+      finishHeightTransition(nextElement);
+    }
+    view.showingOriginal = nextShowingOriginal;
     const text = visible ? "Показать перевод" : "Показать оригинал";
     if (visible) {
       finishTranslationReveal(view.translatedElement);
@@ -1469,6 +1999,9 @@
     if (view.expansionElement) view.expansionElement.hidden = visible;
     if (view.buttonLabel) view.buttonLabel.textContent = text;
     if (view.buttonElement) view.buttonElement.setAttribute("aria-label", text);
+    if (visibilityChanges && options.animate) {
+      transitionHeightFrom(nextElement, startHeight);
+    }
   }
 
   function syncNativeTranslationRow(state) {
@@ -1530,7 +2063,11 @@
       return;
     }
     clearExpansionPending(view);
-    view.metaElement?.remove();
+    const metaMount = view.metaSlotElement || view.metaElement;
+    finishMetaStatusTransition(view.metaSlotElement);
+    finishHeightTransition(metaMount);
+    finishHeightTransition(view.translatedElement);
+    metaMount?.remove();
     finishTranslationReveal(view.translatedElement);
     view.translatedElement?.remove();
     view.sourceElement?.removeAttribute?.("data-xtr-original-hidden");
@@ -1547,9 +2084,10 @@
     const parent = source.parentNode;
     if (!parent) return;
     let repaired = false;
+    const metaMount = view.metaSlotElement || view.metaElement;
 
-    if (view.metaElement.parentNode !== parent || view.metaElement.nextSibling !== source) {
-      source.before(view.metaElement);
+    if (metaMount.parentNode !== parent || metaMount.nextSibling !== source) {
+      source.before(metaMount);
       repaired = true;
     }
     if (
@@ -1571,7 +2109,12 @@
     }
 
     view.sourceElement = source;
-    if (repaired) finishTranslationReveal(view.translatedElement);
+    if (repaired) {
+      finishTranslationReveal(view.translatedElement);
+      finishMetaStatusTransition(view.metaSlotElement);
+      finishHeightTransition(metaMount);
+      finishHeightTransition(view.translatedElement);
+    }
     setOriginalVisible(view, view.showingOriginal);
   }
 

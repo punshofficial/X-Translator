@@ -43,6 +43,18 @@
   display: inline-block;
 }
 
+[data-xtr-height-transition] {
+  overflow: hidden !important;
+  will-change: height;
+}
+
+[data-xtr-meta-slot] {
+  display: flow-root;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
 [data-xtr-owned="translation"][data-xtr-reveal="blur-text"] [data-xtr-blur-token],
 [data-xtr-owned="translation"][data-xtr-reveal="blur-text"] img {
   will-change: filter, opacity, transform;

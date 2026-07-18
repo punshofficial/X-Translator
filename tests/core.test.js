@@ -48,6 +48,13 @@ test("normalizePlainText preserves line breaks while normalizing spacing", () =>
   assert.equal(core.normalizePlainText("  first  \r\n second\tpart  "), "first\nsecond part");
 });
 
+test("hasTranslatableText ignores posts made only of protected links", () => {
+  assert.equal(core.hasTranslatableText("https://example.com", ["https://example.com"]), false);
+  assert.equal(core.hasTranslatableText("example.com 🚀", ["example.com"]), false);
+  assert.equal(core.hasTranslatableText("Read https://example.com", ["https://example.com"]), true);
+  assert.equal(core.hasTranslatableText("これは本文です", []), true);
+});
+
 test("isProtectedToken recognizes links, mentions, hashtags and cashtags", () => {
   for (const value of ["https://example.com/a", "@user_1", "#Привет", "$MSFT"]) {
     assert.equal(core.isProtectedToken(value), true, value);

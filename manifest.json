@@ -32,11 +32,23 @@
         "https://x.com/*",
         "https://twitter.com/*"
       ],
+      "js": [
+        "x-data-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
       "css": [
         "content.css"
       ],
       "js": [
         "shared.js",
+        "tweet-data.js",
         "content.js"
       ],
       "run_at": "document_start"
