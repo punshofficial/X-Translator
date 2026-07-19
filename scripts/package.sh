@@ -16,6 +16,8 @@ FILES=(
   popup.html
   popup.js
   shared.js
+  tweet-data.js
+  x-data-bridge.js
   LICENSE
   THIRD_PARTY_NOTICES.md
   icons/icon16.png
