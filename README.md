@@ -6,9 +6,15 @@
 
 Исходный язык определяется автоматически — перевод работает не только с английским.
 
+[Установить X Translator из Chrome Web Store](https://chromewebstore.google.com/detail/x-translator/jfillcfphbipmijdkcacnhjkoijcndll)
+
 ![Демонстрация X Translator](assets/demo.gif)
 
 ## Установка
+
+Проще всего установить расширение из [Chrome Web Store](https://chromewebstore.google.com/detail/x-translator/jfillcfphbipmijdkcacnhjkoijcndll).
+
+Для ручной установки:
 
 1. Скачайте ZIP из [последнего релиза](https://github.com/punshofficial/X-Translator/releases/latest) и распакуйте его.
 2. Откройте страницу управления расширениями и включите режим разработчика.
